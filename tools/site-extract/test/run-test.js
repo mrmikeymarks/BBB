@@ -9,6 +9,8 @@ const os = require('os');
 const { chromium } = require('playwright');
 const { start, serveStatic } = require('./fixture-server');
 const { crawl } = require('../src/crawl');
+const { sanitizeSegment } = require('../src/urls');
+const A2X = sanitizeSegment('a@2x.png'); // '@' is not filesystem-safe, so the name carries a hash suffix
 
 const read = (f) => fs.readFileSync(f, 'utf8');
 const exists = (f) => fs.existsSync(f);
@@ -30,7 +32,14 @@ async function main() {
   const pageUrls = manifest.pages.filter((p) => p.kind === 'page' && !p.error).map((p) => p.url).sort();
   assert.deepStrictEqual(pageUrls, [
     `${origin}/`, `${origin}/about.html`, `${origin}/blog/post-1`, `${origin}/blog/post-2`, `${origin}/orphan-page.html`, `${origin}/services`,
+    `${origin}/team/john.smith`, `${origin}/team/john.doe`, `${origin}/%E4%BC%9A%E7%A4%BE%E6%A6%82%E8%A6%81`, `${origin}/%E3%81%8A%E5%95%8F%E3%81%84%E5%90%88%E3%82%8F%E3%81%9B`,
+    `${origin}/latin.html`,
   ].sort(), 'crawled page set');
+  assert.strictEqual(manifest.pages.find((p) => p.url === `${origin}/fb`).kind, 'external-redirect', 'off-site redirect recorded');
+  assert.strictEqual(manifest.pages.find((p) => p.url === `${origin}/download`).kind, 'file', 'attachment download captured as file');
+  assert.ok(!manifest.assets[`${origin}/`] && !manifest.assets[`${origin}/about.html`] && !manifest.assets[`${origin}/services`] && !manifest.assets[`${origin}/services/`], `pages must not be captured as raw assets: ${Object.keys(manifest.assets).filter((k) => /html|\/$/.test(k))}`);
+  assert.strictEqual(manifest.pages.find((p) => p.url === `${origin}/menu`).kind, 'file', 'extension-less PDF recorded as file');
+  assert.strictEqual(manifest.pages.find((p) => p.url === `${origin}/feed`).kind, 'file', 'RSS feed recorded as file, not page');
   const p404 = manifest.pages.find((p) => p.url === `${origin}/blog/post-2`);
   assert.strictEqual(p404.status, 404, '404 page recorded with its status');
   assert.ok(manifest.pages.find((p) => p.url === `${origin}/orphan-page.html`), 'sitemap-only page crawled');
@@ -38,17 +47,24 @@ async function main() {
   assert.ok(manifest.pages.find((p) => p.url === `${origin}/files/brochure.pdf` && p.kind === 'file') || manifest.assets[`${origin}/files/brochure.pdf`], 'PDF link captured as a file');
 
   for (const f of ['index.html', 'about/index.html'.replace('about/index.html', 'about.html'), 'services/index.html', 'blog/post-1/index.html', 'orphan-page.html', 'old/index.html',
-    `${A}/css/main.css`, `${A}/css/extra.css`, `${A}/fonts/f.woff2`, `${A}/img/a.png`, `${A}/img/a_2x.png`, `${A}/img/lazy.png`, `${A}/img/bg.png`, `${A}/img/hero.png`,
+    `${A}/css/main.css`, `${A}/css/extra.css`, `${A}/fonts/f.woff2`, `${A}/img/a.png`, `${A}/img/${A2X}`, `${A}/img/lazy.png`, `${A}/img/bg.png`, `${A}/img/hero.png`,
     `${A}/img/dynamic.png`, `${A}/img/cdn-only.png`, `${A}/img/favicon.png`, `${A}/img/sprite.svg`, `${A}/js/app.js`, `${A}/js/chunk.js`, `${A}/api/data.json`, `${A}/api/xhr.json`,
-    `${A}/files/brochure.pdf`, '_mirror/shim.js', '_mirror/map.js']) {
+    `${A}/files/brochure.pdf`, '_mirror/shim.js', '_mirror/map.js', `${A}/menu.pdf`, 'menu/index.html', `${A}/feed.xml`, `${A}/services/data.json`,
+    'team/john.smith/index.html', 'team/john.doe/index.html']) {
     assert.ok(exists(path.join(site, f)), `missing mirrored file: ${f}`);
   }
+
+  for (const [f, expected] of [[`${A}/img/a.png`, 'PNGFAKE-a'], [`${A}/img/${A2X}`, 'PNGFAKE-a2x'], [`${A}/img/lazy.png`, 'PNGFAKE-lazy'], [`${A}/img/hero.png`, 'PNGFAKE-hero'], [`${A}/img/dynamic.png`, 'PNGFAKE-dyn'], [`${A}/fonts/f.woff2`, 'WOFF2FAKE'], [`${A}/api/data.json`, null]]) {
+    const got = read(path.join(site, f));
+    assert.ok(got.length > 0 && (expected === null || got === expected), `asset body captured intact: ${f} (${JSON.stringify(got.slice(0, 30))})`);
+  }
+  assert.ok(fs.statSync(path.join(site, `${A}/img/real.png`)).size === fs.statSync(path.join(__dirname, 'fixture/img/real.png')).size, 'valid PNG captured byte-for-byte');
 
   // ---- HTML rewriting ----------------------------------------------------
   const home = read(path.join(site, 'index.html'));
   assert.ok(!home.includes(`href="${origin}`) && !home.includes(`src="${origin}`), 'no absolute origin URLs left in src/href');
   assert.ok(home.includes(`href="${A}/css/main.css"`), 'stylesheet rewritten');
-  assert.ok(home.includes(`srcset="${A}/img/a.png 1x, ${A}/img/a_2x.png 2x"`), `srcset rewritten: ${home.match(/srcset="[^"]*"/)}`);
+  assert.ok(home.includes(`srcset="${A}/img/a.png 1x, ${A}/img/${A2X} 2x"`), `srcset rewritten: ${home.match(/srcset="[^"]*"/)}`);
   assert.ok(home.includes(`href="about.html"`), 'relative page link rewritten');
   assert.ok(home.includes(`href="services/index.html"`), 'directory page link rewritten');
   assert.ok(home.includes(`href="about.html#team"`), 'tracking params dropped, fragment kept');
@@ -56,17 +72,44 @@ async function main() {
   assert.ok(home.includes('href="https://external.example.org/partner"'), 'external link untouched');
   assert.ok(home.includes('href="mailto:hello@fixture.test"'), 'mailto untouched');
   assert.ok(home.includes(`href="${A}/files/brochure.pdf"`), 'file link rewritten');
+  assert.ok(home.includes(`href="${A}/files/brochure.pdf">Brochure (tracked link)`), `tracked file link rewritten: ${home.match(/href="[^"]*">Brochure \(tracked link\)/)}`);
+  assert.ok(/href="_assets\/[^"]*\/files\/brochure__q_[0-9a-f]{8}\.pdf">Brochure \(unsorted params\)/.test(home), 'query file link rewritten');
+  assert.ok(home.includes(`href="menu/index.html"`), 'extension-less file link goes to its stub');
+  assert.ok(read(path.join(site, 'menu/index.html')).includes(`url=../${A}/menu.pdf`), 'file stub forwards to the captured file');
+  assert.ok(home.includes(`href="about.html">About us`), 'prefetched page link still points at the mirrored page, not the raw copy');
+  assert.ok(home.includes(`href="index.html">Home`) && home.includes(`href="#top">Top`), `home/anchor links intact: ${home.match(/href="[^"]*">(Home|Top)</g)}`);
+  assert.ok(home.includes(`<use href="#icon-inline">`), 'fragment-only <use> untouched');
+  assert.ok(/class="card" href="services\/index\.html" style="background-image: url\(['"]?_assets\/[^)]*img\/hero\.png/.test(home), `<a style=background> rewritten: ${home.match(/class="card"[^>]*>/)}`);
+  assert.ok(new RegExp(`<style id="cssom">[^<]*url\\("?${A.replace(/[.]/g, '\\.')}/img/bg\\.png`).test(home), `CSSOM rules serialised and rewritten: ${home.match(/<style id="cssom">[^<]*<\/style>/)}`);
+  assert.ok(home.includes(`imagesrcset="${A}/img/a.png 1x, ${A}/img/${A2X} 2x"`), 'imagesrcset rewritten');
+  assert.ok(home.includes(`href="fb/index.html"`) && read(path.join(site, 'fb/index.html')).includes('url=https://external.example.org/fb'), 'external redirect stub');
+  assert.ok(home.includes(`href="download/index.html"`) && /url=\.\.\/_assets\/[^"]*\/download\.bin"?/.test(read(path.join(site, 'download/index.html'))) || read(path.join(site, 'download/index.html')).includes('_assets/'), `download stub: ${read(path.join(site, 'download/index.html'))}`);
+  assert.ok(home.startsWith('<!DOCTYPE html>') && /<head><meta charset="utf-8"><script data-mirror="config">/.test(home), `charset meta first, then shim: ${home.slice(0, 200)}`);
+  const latin = fs.readFileSync(path.join(site, 'latin.html'));
+  assert.ok(latin.toString('utf8').includes('<meta charset="utf-8">') && !latin.toString('utf8').includes('iso-8859-1') && latin.toString('utf8').includes('Café crème €'), 'latin-1 page re-declared as utf-8 with intact text');
+  assert.ok(home.includes(`href="team/john.smith/index.html"`) && home.includes(`href="team/john.doe/index.html"`), 'dotted slugs kept distinct');
+  assert.ok(read(path.join(site, 'team/john.smith/index.html')).includes('JOHN SMITH PAGE') && read(path.join(site, 'team/john.doe/index.html')).includes('JOHN DOE PAGE'), 'dotted-slug pages not overwritten');
+  const jpPages = manifest.pages.filter((p) => /%E4%BC%9A|%E3%81%8A/.test(p.url)).map((p) => p.local);
+  assert.strictEqual(new Set(jpPages).size, 2, `non-ASCII pages get distinct paths: ${jpPages}`);
+  assert.ok(read(path.join(out, jpPages[0])).includes('PAGE') && read(path.join(out, jpPages[1])).includes('PAGE'));
+  const mediaOrig = manifest.assets[`${origin}/media/x.jpg`], mediaVar = manifest.assets[`${origin}/media/x.jpg/v1/fill/w_10/x.jpg`];
+  assert.ok(mediaOrig && mediaVar && mediaOrig.local !== mediaVar.local, 'file/dir prefix conflict: both assets recorded with distinct paths');
+  assert.strictEqual(read(path.join(out, mediaOrig.local)), 'JPGFAKE-orig', 'file/dir prefix conflict: original written');
+  assert.strictEqual(read(path.join(out, mediaVar.local)), 'JPGFAKE-transformed', 'file/dir prefix conflict: variant written');
+  assert.ok(home.includes(`src="${mediaOrig.local.replace(/^site\//, '')}"`) && home.includes(`src="${mediaVar.local.replace(/^site\//, '')}"`), 'file/dir prefix conflict: HTML references both');
+  assert.ok(!Object.keys(manifest.failed).length, `no failed assets: ${JSON.stringify(manifest.failed)}`);
   assert.ok(home.includes(`url("${A}/img/hero.png")`) || home.includes(`url(${A}/img/hero.png)`), 'inline <style> url() rewritten');
   assert.ok(/style="background:\s*url\(['"]?_assets\/[^)]*img\/bg\.png/.test(home), 'style attribute url() rewritten');
   assert.ok(!home.includes('rel="preconnect"'), 'preconnect removed');
   assert.ok(home.includes('_mirror/shim.js') && home.includes('_mirror/map.js') && home.indexOf('_mirror/shim.js') < home.indexOf('js/app.js'), 'shim injected before app script');
   assert.ok(home.includes('application/ld+json'), 'JSON-LD kept');
   const services = read(path.join(site, 'services/index.html'));
+  assert.ok(services.includes(`window.__MIRROR_ORIGIN="${origin}/services/"`), `shim origin keeps the trailing slash: ${services.match(/__MIRROR_ORIGIN="[^"]*"/)}`);
   assert.ok(services.includes(`href="../${A}/css/main.css"`), 'nested page uses ../ asset path');
   assert.ok(services.includes(`href="../index.html"`) && services.includes(`href="../about.html"`), 'nested page links rewritten');
   assert.ok(services.includes(`href="../${A}/img/sprite.svg#icon-leaf"`), 'svg <use> rewritten with fragment');
   const about = read(path.join(site, 'about.html'));
-  assert.ok(about.includes(`srcset="${A}/img/a_2x.png 2x, ${A}/img/a.png 1x"`), '<source srcset> rewritten');
+  assert.ok(about.includes(`srcset="${A}/img/${A2X} 2x, ${A}/img/a.png 1x"`), '<source srcset> rewritten');
   const stub = read(path.join(site, 'old/index.html'));
   assert.ok(stub.includes('url=../about.html'), 'redirect stub points at target');
 
@@ -142,9 +185,15 @@ async function main() {
     assert.strictEqual(await page.textContent('h1'), 'About us', 'redirect stub works');
     await page.goto(mirror.origin + '/services/index.html', { waitUntil: 'networkidle' });
     assert.deepStrictEqual(failed, [], 'nested page stays inside the mirror');
+    await page.waitForFunction(() => document.getElementById('rel-fetch').textContent !== 'pending', null, { timeout: 5000 });
+    assert.strictEqual(await page.textContent('#rel-fetch'), 'rel-fetch:true', 'relative fetch on a directory page resolves through the shim');
+
     await page.click('text=Home');
     await page.waitForURL('**/index.html');
     assert.deepStrictEqual(bad, [], `broken requests after navigation: ${bad.join(', ')}`);
+    const stubResp = await page.goto(mirror.origin + '/menu/index.html', { waitUntil: 'load' }).catch(() => null);
+    assert.ok(stubResp === null || stubResp.ok(), 'file stub page served');
+    assert.ok(read(path.join(site, 'menu/index.html')).includes(`url=../${A}/menu.pdf`), 'file stub forwards to the captured PDF');
   } finally { await browser.close(); mirror.server.close(); }
 
   // ---- strip-scripts variant ----------------------------------------------

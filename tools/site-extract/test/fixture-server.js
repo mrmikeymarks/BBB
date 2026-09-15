@@ -13,6 +13,14 @@ function start(port = 0) {
     const url = new URL(req.url, 'http://x');
     const host = req.headers.host;
     if (url.pathname === '/old') { res.writeHead(301, { Location: '/about.html' }); return res.end(); }
+    if (url.pathname === '/fb') { res.writeHead(302, { Location: 'https://external.example.org/fb' }); return res.end(); }
+    if (url.pathname === '/download') { res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="price-list.bin"' }); return res.end('BINARY-DOWNLOAD'); }
+    if (url.pathname === '/latin.html') { res.writeHead(200, { 'content-type': 'text/html; charset=iso-8859-1' }); return res.end(fs.readFileSync(path.join(ROOT, 'latin.html'))); }
+    if (url.pathname === '/menu') { res.writeHead(200, { 'content-type': 'application/pdf' }); return res.end('%PDF-1.4 menu'); }
+    if (url.pathname === '/feed') { res.writeHead(200, { 'content-type': 'application/rss+xml' }); return res.end('<?xml version="1.0"?><rss><channel><title>Feed</title></channel></rss>'); }
+    if (url.pathname === '/media/x.jpg/v1/fill/w_10/x.jpg') { res.writeHead(200, { 'content-type': 'image/jpeg' }); return res.end('JPGFAKE-transformed'); }
+    const pathAlias = { '/team/john.smith': '/team/john.smith.html', '/team/john.doe': '/team/john.doe.html', '/%E4%BC%9A%E7%A4%BE%E6%A6%82%E8%A6%81': '/company-jp.html', '/%E3%81%8A%E5%95%8F%E3%81%84%E5%90%88%E3%82%8F%E3%81%9B': '/contact-jp.html' };
+    if (pathAlias[url.pathname]) url.pathname = pathAlias[url.pathname];
     if (url.pathname === '/api/data.json') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ items: ['Coast walk', 'Wetland stay', 'Mountain hut'] })); }
     if (url.pathname === '/api/xhr.json') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: true })); }
     if (url.pathname === '/robots.txt') { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end(`User-agent: *\nAllow: /\nSitemap: http://${host}/sitemap.xml\n`); }

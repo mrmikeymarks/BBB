@@ -11,7 +11,11 @@ function scanPage() {
   const isHttp = (h) => /^https?:/i.test(h || '');
   const links = new Set();
   const refs = new Set();
-  const addRef = (v) => { const h = v && abs(v); if (h && isHttp(h)) refs.add(h); };
+  const addRef = (v) => { if (!v || /^\s*#/.test(v)) return; const h = abs(v); if (h && isHttp(h)) refs.add(h); };
+  const sheetText = (el) => { // CSSOM-only rules (insertRule / CSS-in-JS) are invisible in textContent
+    try { if (el.sheet && el.sheet.cssRules.length && !el.textContent.trim()) return [...el.sheet.cssRules].map((r) => r.cssText).join('\n'); } catch { /* cross-origin */ }
+    return el.textContent;
+  };
 
   function parseSrcset(s) {
     const out = []; const toks = String(s || '').trim().split(/\s+/).filter(Boolean);
@@ -47,7 +51,7 @@ function scanPage() {
   const ATTRS = ['src', 'poster', 'data-src', 'data-lazy-src', 'data-original', 'data-bg', 'data-background'];
   for (const el of document.querySelectorAll('*')) {
     const tag = el.tagName.toLowerCase();
-    if (tag === 'a' || tag === 'area' || tag === 'base') continue;
+    if (tag === 'base') continue;
     for (const at of ATTRS) if (el.hasAttribute(at)) addRef(el.getAttribute(at));
     if (tag === 'link') {
       const rel = (el.getAttribute('rel') || '').toLowerCase();
@@ -55,10 +59,11 @@ function scanPage() {
     }
     if (tag === 'object' && el.hasAttribute('data')) addRef(el.getAttribute('data'));
     if (tag === 'use' || tag === 'image') addRef(el.getAttribute('href') || el.getAttribute('xlink:href'));
-    for (const at of ['srcset', 'data-srcset', 'data-lazy-srcset']) if (el.hasAttribute(at)) for (const c of parseSrcset(el.getAttribute(at))) addRef(c.url);
+    for (const at of ['srcset', 'data-srcset', 'data-lazy-srcset', 'imagesrcset']) if (el.hasAttribute(at)) for (const c of parseSrcset(el.getAttribute(at))) addRef(c.url);
     if (el.hasAttribute('style')) for (const u of cssUrls(el.getAttribute('style'))) addRef(u);
-    if (tag === 'style') for (const u of cssUrls(el.textContent)) addRef(u);
+    if (tag === 'style') for (const u of cssUrls(sheetText(el))) addRef(u);
   }
+  for (const sheet of (document.adoptedStyleSheets || [])) { try { for (const u of cssUrls([...sheet.cssRules].map((r) => r.cssText).join('\n'))) addRef(u); } catch { /* ignore */ } }
 
   // ---- text extraction ----------------------------------------------------
   const meta = (sel, attr = 'content') => { const el = document.querySelector(sel); return el ? (el.getAttribute(attr) || '').trim() : ''; };
@@ -180,7 +185,7 @@ function rewriteDocument(arg) {
   };
   const noHash = (h) => h.replace(/#.*$/, '');
   const hashOf = (h) => { const i = h.indexOf('#'); return i >= 0 ? h.slice(i) : ''; };
-  const localFor = (v) => { const h = v && abs(v); if (!h) return null; const l = map[noHash(h)] || map[h]; return l ? rel(l) + hashOf(h) : null; };
+  const localFor = (v) => { if (!v || /^\s*#/.test(v)) return null; const h = abs(v); if (!h) return null; const l = map[noHash(h)] || map[h]; return l ? rel(l) + hashOf(h) : null; };
   const pageMap = pagePathFor || {};
 
   function parseSrcset(s) {
@@ -207,22 +212,38 @@ function rewriteDocument(arg) {
     .replace(/@import\s+(['"])([^'"]+)\1/gi, (m, q, u) => { const l = localFor(u); return l ? `@import ${q}${l}${q}` : m; });
 
   const root = document.documentElement.cloneNode(true);
-  // Drop things that break an offline copy.
-  for (const el of root.querySelectorAll('base, meta[http-equiv="Content-Security-Policy" i]')) el.remove();
+  // Stylesheets whose rules live only in the CSSOM (insertRule, CSS-in-JS) have
+  // an empty text node in the clone; serialise the live rules into it.
+  const liveStyles = document.querySelectorAll('style');
+  const cloneStyles = root.querySelectorAll('style');
+  if (liveStyles.length === cloneStyles.length) {
+    liveStyles.forEach((live, i) => {
+      try { if (live.sheet && live.sheet.cssRules.length && !live.textContent.trim()) cloneStyles[i].textContent = [...live.sheet.cssRules].map((r) => r.cssText).join('\n'); } catch { /* ignore */ }
+    });
+  }
+  const headEl = root.querySelector('head') || root;
+  for (const sheet of (document.adoptedStyleSheets || [])) {
+    try { const st = document.createElement('style'); st.setAttribute('data-mirror', 'adopted'); st.textContent = [...sheet.cssRules].map((r) => r.cssText).join('\n'); headEl.appendChild(st); } catch { /* ignore */ }
+  }
+  // Drop things that break an offline copy. The file is written as UTF-8, so
+  // the charset declaration must say so whatever the live page declared.
+  for (const el of root.querySelectorAll('base, meta[http-equiv="Content-Security-Policy" i], meta[charset], meta[http-equiv="Content-Type" i]')) el.remove();
+  const charset = document.createElement('meta'); charset.setAttribute('charset', 'utf-8'); headEl.insertBefore(charset, headEl.firstChild);
   if (stripScripts) for (const s of root.querySelectorAll('script')) { if ((s.getAttribute('type') || '').toLowerCase() !== 'application/ld+json') s.remove(); }
 
   const ATTRS = ['src', 'poster', 'data-src', 'data-lazy-src', 'data-original', 'data-bg', 'data-background'];
   for (const el of root.querySelectorAll('*')) {
     const tag = el.tagName.toLowerCase();
     if (tag === 'a' || tag === 'area') {
-      const h = abs(el.getAttribute('href'));
-      if (!h || !/^https?:/i.test(h)) continue;
-      const l = localFor(h);
-      if (l) { el.setAttribute('href', l); continue; }
-      const key = noHash(h);
-      const lp = pageMap[key] || pageMap[key.replace(/\/+$/, '')];
-      if (lp) el.setAttribute('href', rel(lp) + hashOf(h));
-      continue;
+      const rawHref = el.getAttribute('href') || '';
+      const h = /^\s*#/.test(rawHref) ? null : abs(rawHref); // same-page anchors stay as they are
+      if (h && /^https?:/i.test(h)) {
+        const key = noHash(h);
+        const lp = pageMap[key] || pageMap[key.replace(/\/+$/, '')];
+        const l = lp ? rel(lp) + hashOf(h) : localFor(h); // known pages win over a raw captured copy
+        if (l) el.setAttribute('href', l);
+      }
+      // fall through: an <a> can also carry style/data-src/etc.
     }
     if (tag === 'form') continue;
     for (const at of ATTRS) if (el.hasAttribute(at)) { const l = localFor(el.getAttribute(at)); if (l) el.setAttribute(at, l); }
@@ -237,7 +258,7 @@ function rewriteDocument(arg) {
     if (tag === 'use' || tag === 'image') {
       for (const at of ['href', 'xlink:href']) if (el.hasAttribute(at)) { const l = localFor(el.getAttribute(at)); if (l) el.setAttribute(at, l); }
     }
-    for (const at of ['srcset', 'data-srcset', 'data-lazy-srcset']) if (el.hasAttribute(at)) el.setAttribute(at, rewriteSrcset(el.getAttribute(at)));
+    for (const at of ['srcset', 'data-srcset', 'data-lazy-srcset', 'imagesrcset']) if (el.hasAttribute(at)) el.setAttribute(at, rewriteSrcset(el.getAttribute(at)));
     if (el.hasAttribute('style')) el.setAttribute('style', rewriteCssText(el.getAttribute('style')));
     if (tag === 'style') el.textContent = rewriteCssText(el.textContent);
     if (tag === 'iframe' && el.hasAttribute('src')) { const l = localFor(el.getAttribute('src')); if (l) el.setAttribute('src', l); }
@@ -251,13 +272,14 @@ function rewriteDocument(arg) {
     mapScript.setAttribute('data-mirror', 'map');
     const cfg = document.createElement('script');
     cfg.setAttribute('data-mirror', 'config');
-    cfg.textContent = `window.__MIRROR_ROOT=${JSON.stringify(rootPrefix)};window.__MIRROR_ORIGIN=${JSON.stringify(origin)};`;
+    cfg.textContent = `window.__MIRROR_ROOT=${JSON.stringify(rootPrefix)};window.__MIRROR_ORIGIN=${JSON.stringify(document.baseURI)};`;
     const shim = document.createElement('script');
     shim.setAttribute('src', rootPrefix + '_mirror/shim.js');
     shim.setAttribute('data-mirror', 'shim');
-    head.insertBefore(shim, head.firstChild);
-    head.insertBefore(mapScript, head.firstChild);
-    head.insertBefore(cfg, head.firstChild);
+    const anchor = charset.nextSibling;
+    head.insertBefore(cfg, anchor);
+    head.insertBefore(mapScript, anchor);
+    head.insertBefore(shim, anchor);
   }
 
   const doctype = document.doctype ? `<!DOCTYPE ${document.doctype.name}${document.doctype.publicId ? ` PUBLIC "${document.doctype.publicId}"` : ''}${document.doctype.systemId ? ` "${document.doctype.systemId}"` : ''}>` : '<!DOCTYPE html>';

@@ -11,14 +11,21 @@
 <link rel="stylesheet" href="css/main.css">
 <link rel="preload" href="/fonts/f.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preconnect" href="https://fonts.gstatic.com">
+<link rel="prefetch" href="/about.html">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"TravelAgency","name":"Fixture Travel Co"}</script>
 <style>.hero { background-image: url("/img/hero.png"); }</style>
+<style id="cssom"></style>
+<script>document.getElementById('cssom').sheet.insertRule('.cssom-card { background-image: url("/img/bg.png"); color: rebeccapurple; }', 0);</script>
+<link rel="preload" as="image" imagesrcset="/img/a.png 1x, /img/a@2x.png 2x" imagesizes="100vw">
 </head>
 <body>
 <header>
   <nav>
     <ul>
       <li><a href="/">Home</a></li>
+      <li><a href="#top">Top</a></li>
+      <li><a href="/fb">Facebook (vanity redirect)</a></li>
+      <li><a href="/download">Download (attachment)</a></li>
       <li><a href="about.html">About us</a></li>
       <li><a href="/services/">Services</a></li>
       <li><a href="blog/post-1/">Blog</a></li>
@@ -31,6 +38,10 @@
   </nav>
 </header>
 <main>
+  <svg width="20" height="20"><use href="#icon-inline"></use></svg>
+  <svg style="display:none"><symbol id="icon-inline" viewBox="0 0 10 10"><path d="M0 0h10v10z"/></symbol></svg>
+  <a class="card" href="/services/" style="background-image: url('/img/hero.png')">Card link with background</a>
+  <div class="cssom-card">Styled by CSSOM rule</div>
   <section class="hero">
     <h1>Travel that gives back</h1>
     <p>We design small-group trips that leave places better than we found them.</p>
@@ -46,6 +57,17 @@
     <ul id="dynamic-list"><li>Loading...</li></ul>
     <blockquote>"Best trip of my life" - a guest</blockquote>
     <a href="files/brochure.pdf">Download brochure (PDF)</a>
+    <a href="/files/brochure.pdf?utm_campaign=site">Brochure (tracked link)</a>
+    <a href="/files/brochure.pdf?b=1&amp;a=2">Brochure (unsorted params)</a>
+    <a href="/menu">Menu (extension-less PDF)</a>
+    <a href="/feed">RSS feed</a>
+    <a href="/team/john.smith">John Smith</a>
+    <a href="/team/john.doe">John Doe</a>
+    <a href="/会社概要">Company (JP)</a>
+    <a href="/お問い合わせ">Contact (JP)</a>
+    <img src="/media/x.jpg" alt="Original media">
+    <img src="/img/real.png" alt="Real PNG">
+    <img src="/media/x.jpg/v1/fill/w_10/x.jpg" alt="Transformed media">
     <div hidden>Hidden text must not be extracted</div>
     <div style="display:none">Display none text must not be extracted</div>
   </section>

@@ -99,7 +99,9 @@ Page slugs derive from the path: `/` is `home`, `/about` is `about`, `/blog/post
 * Each page is loaded, scrolled to the bottom to trigger lazy loading, and left to settle. Every network response the browser saw is saved under `site/_assets/<host>/...` (file names keep the URL path; query strings become a short hash suffix; extensions are corrected from the Content-Type when missing).
 * Responsive image candidates, lazy-load attributes, `<link>`s, inline `style` and `<style>` references, SVG `<use>` targets and same-site file links (PDFs etc.) that the browser did not load are fetched separately so the mirror is complete.
 * Stylesheets are rewritten after the crawl: `url()` and `@import` targets are fetched (fonts, background images) and rewritten to relative paths.
-* Same-site `<a href>`s are rewritten to the deterministic local path of the target page. Redirecting URLs get a stub page that forwards to the real target, so old links keep working.
+* Same-site `<a href>`s are rewritten to the deterministic local path of the target page. Redirecting URLs get a stub page that forwards to the real target (or to the off-site destination), extension-less URLs that turn out to be files get a stub that forwards to the captured file, so every link keeps working.
+* Stylesheet rules that exist only in the CSSOM (`insertRule`, CSS-in-JS runtimes) are serialised into the saved `<style>` tags; `adoptedStyleSheets` are appended as extra `<style>` tags.
+* Files are written as UTF-8 and the charset declaration is normalised to match, whatever the live page declared.
 * `<base>`, CSP meta tags, `preconnect`/`dns-prefetch` hints, and `integrity` attributes on rewritten resources are removed. Service workers are disabled.
 * The shim is the first script on each page. It patches `fetch`, `XMLHttpRequest.open`, `setAttribute`, and the `src`/`href`/`srcset` setters on script, image, source, link, iframe and media elements, mapping original absolute URLs to captured files. Anything not captured falls through unchanged.
 
@@ -111,4 +113,6 @@ Third-party embeds that need a live service (maps, booking widgets, analytics, c
 npm test
 ```
 
-Starts a local fixture site (redirects, lazy images, `srcset`, `@import`, fonts, fetch/XHR-driven content, a sitemap-only page, a PDF), crawls it, checks the rewritten output and extraction, then loads the mirror in a browser with every request to the original host blocked and verifies the JS-driven content still renders.
+Starts a local fixture site (redirects on and off site, lazy images, `srcset`/`imagesrcset`, `@import`, fonts, fetch/XHR-driven content including page-relative fetches, CSSOM-only rules, a sitemap-only page, PDFs with and without an extension, an attachment download, an RSS feed, non-ASCII and dotted slugs, a Latin-1 page, Wix-style file/directory path clashes), crawls it, checks the rewritten output and extraction, then loads the mirror in a browser with every request to the original host blocked and verifies the JS-driven content still renders.
+
+In a sandbox without a Playwright browser download, point the test at an existing binary: `SITE_EXTRACT_CHROMIUM=/path/to/chrome npm test`.

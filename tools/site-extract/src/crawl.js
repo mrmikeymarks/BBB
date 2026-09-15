@@ -68,7 +68,9 @@ class Crawler {
     this.pages = new Map();        // normalized href -> page record
     this.queue = [];
     this.assets = new Map();       // abs url (no hash) -> { local, contentType, size, kind }
-    this.localPaths = new Map();   // local path -> abs url (collision guard)
+    this.localPaths = new Map();   // local file path -> abs url (collision guard)
+    this.dirPrefixes = new Set();  // every directory prefix of a saved asset
+    this.pageLocals = new Map();   // page local path -> page url
     this.redirects = new Map();    // abs url -> abs url
     this.failed = new Map();       // abs url -> reason
     this.inFlight = new Map();     // abs url -> promise
@@ -79,6 +81,7 @@ class Crawler {
   }
 
   isSameSite(u) { return U.isSameSite(u, this.start, this.opts); }
+  pageLocal(u) { return U.pageLocalPath(u, this.start); }
 
   enqueue(href) {
     if (this.pages.has(href)) return false;
@@ -105,21 +108,40 @@ class Crawler {
     return map;
   }
 
+  /** Pick a local path that collides with no other file and no directory. */
+  claimLocalPath(wanted, key) {
+    let local = wanted;
+    const suffixLeaf = (p, suf) => p.replace(/(\.[^./]+)?$/, (m) => `${suf}${m || ''}`);
+    for (let guard = 0; guard < 8; guard++) {
+      if (this.localPaths.has(local) && this.localPaths.get(local) !== key) { local = suffixLeaf(local, `__${U.shortHash(key)}`); continue; }
+      const parts = local.split('/');
+      let fileAncestor = null;
+      for (let i = 1; i < parts.length; i++) { const pre = parts.slice(0, i).join('/'); if (this.localPaths.has(pre)) { fileAncestor = pre; break; } }
+      if (fileAncestor) { local = fileAncestor + '__d/' + local.slice(fileAncestor.length + 1); continue; }
+      if (this.dirPrefixes.has(local)) { local = suffixLeaf(local, '__f'); continue; }
+      break;
+    }
+    this.localPaths.set(local, key);
+    const parts = local.split('/');
+    for (let i = 1; i < parts.length; i++) this.dirPrefixes.add(parts.slice(0, i).join('/'));
+    return local;
+  }
+
   saveAsset(key, body, contentType, kind) {
     const existing = this.assets.get(key);
     if (existing && existing.local) return existing;
     if (this.assets.size >= this.opts.maxAssets) { this.failed.set(key, 'max-assets reached'); return null; }
-    let local = U.assetLocalPath(new URL(key), contentType);
-    if (this.localPaths.has(local) && this.localPaths.get(local) !== key) {
-      local = local.replace(/(\.[^./]+)?$/, (m) => `__${U.shortHash(key)}${m || ''}`);
-    }
+    const local = this.claimLocalPath(U.assetLocalPath(new URL(key), contentType), key);
     const rec = { local, contentType, size: body.length, kind };
     this.assets.set(key, rec);
-    this.localPaths.set(local, key);
     if (/^text\/css/.test(contentType)) {
       this.cssText.set(key, body.toString('utf8'));
     } else {
-      rec.write = writeFileSafe(path.join(this.siteDir, local), body).catch((e) => { this.failed.set(key, 'write: ' + firstLine(e)); });
+      rec.write = writeFileSafe(path.join(this.siteDir, local), body).catch((e) => {
+        this.failed.set(key, 'write: ' + firstLine(e));
+        this.assets.delete(key);
+        this.localPaths.delete(local);
+      });
     }
     return rec;
   }
@@ -128,23 +150,29 @@ class Crawler {
     try {
       const req = resp.request();
       const rt = req.resourceType();
-      if (rt === 'document' || rt === 'websocket' || rt === 'eventsource') return;
+      if (rt === 'websocket' || rt === 'eventsource') return;
       const u = U.normalizeUrl(resp.url());
       if (!u) return;
       const key = u.href;
       const status = resp.status();
       if (status >= 300 && status < 400) {
+        // Recorded for documents too, so a page whose redirect target is
+        // unreachable can still be classified from the chain.
         const loc = resp.headers()['location'];
         const t = loc && U.normalizeUrl(loc, key);
         if (t) this.redirects.set(key, t.href);
         return;
       }
-      if (status < 200 || status >= 300 || status === 204) return;
+      if (rt === 'document') return;
+      if (status < 200 || status >= 300 || status === 204 || status === 206) return; // 206: range request, partial body
       if (this.assets.has(key)) return;
       this.assets.set(key, { pending: true });
       let body;
       try { body = await resp.body(); } catch (e) { this.assets.delete(key); return; }
       if (body.length > this.opts.maxAssetBytes) { this.assets.delete(key); this.failed.set(key, 'too large'); return; }
+      // Chromium hands back an empty body for prefetches and for images it could
+      // not decode; leave those to the follow-up fetch pass instead of saving junk.
+      if (body.length === 0 && resp.headers()['content-length'] !== '0') { this.assets.delete(key); return; }
       this.assets.delete(key);
       const ct = (resp.headers()['content-type'] || '').split(';')[0].trim().toLowerCase();
       this.saveAsset(key, body, ct, rt);
@@ -217,17 +245,27 @@ class Crawler {
     try {
       resp = await page.goto(pageUrl, { waitUntil: 'load', timeout: this.opts.timeout });
     } catch (e) {
-      if (/Download is starting/i.test(e.message)) {
-        rec.kind = 'file'; rec.local = await this.fetchAsset(pageUrl, 'file'); rec.done = true; return rec;
+      if (!/Timeout/i.test(e.message)) {
+        // A redirect chain that leaves the site (vanity /facebook links) can fail
+        // in the browser when the target is unreachable; classify it from the chain.
+        let hop = pageUrl; let end = null;
+        for (let i = 0; i < 10 && this.redirects.has(hop); i++) { hop = this.redirects.get(hop); end = hop; }
+        const endU = end && U.normalizePageUrl(end);
+        if (endU && !this.isSameSite(endU)) { rec.finalUrl = endU.href; rec.kind = 'external-redirect'; rec.done = true; return rec; }
+        // Downloads and aborted navigations (Content-Disposition: attachment, PDFs
+        // in some Chromium builds) surface as errors; capture the bytes directly.
+        const local = await this.fetchAsset(pageUrl, 'file');
+        const asset = local && [...this.assets.values()].find((a) => a.local === local);
+        if (asset && !/html/.test(asset.contentType || '')) { rec.kind = 'file'; rec.local = local; rec.done = true; return rec; }
+        rec.error = firstLine(e); rec.done = true; return rec;
       }
-      if (!/Timeout/i.test(e.message)) { rec.error = firstLine(e); rec.done = true; return rec; }
       this.log(`[warn] load timeout, continuing with partial page: ${pageUrl}`);
     }
     try { await page.waitForLoadState('networkidle', { timeout: Math.min(this.opts.timeout, 15000) }); } catch { /* busy page */ }
     if (resp) {
       rec.status = resp.status();
       const ct = (resp.headers()['content-type'] || '').toLowerCase();
-      if (ct && !/html|xml/.test(ct)) {
+      if (ct && !/html/.test(ct)) {
         let body = null;
         try { body = await resp.body(); } catch { /* ignore */ }
         const saved = body ? this.saveAsset(U.normalizeUrl(resp.url()).href, body, ct.split(';')[0].trim(), 'file') : null;
@@ -248,7 +286,9 @@ class Crawler {
     const canon = this.pages.get(canonicalHref);
     canon.finalUrl = finalU.href;
     canon.status = rec.status;
-    const local = U.pageLocalPath(new URL(canonicalHref));
+    const local = this.pageLocal(new URL(canonicalHref));
+    if (this.pageLocals.has(local) && this.pageLocals.get(local) !== canonicalHref) this.log(`[warn] ${canonicalHref} and ${this.pageLocals.get(local)} both map to site/${local}; the later one wins`);
+    this.pageLocals.set(local, canonicalHref);
     canon.local = local;
 
     try { await page.evaluate(B.autoScroll, 700, 120); } catch { /* ignore */ }
@@ -265,13 +305,20 @@ class Crawler {
     for (const raw of scan.links) {
       const n = U.normalizePageUrl(raw);
       if (!n || !this.isSameSite(n)) continue;
-      if (U.looksLikeFile(n)) { fileLinks.push(n.href); continue; }
-      pagePathFor[raw.replace(/#.*$/, '')] = U.pageLocalPath(n);
+      const rawKey = raw.replace(/#.*$/, '');
+      const known = this.pages.get(n.href);
+      if (U.looksLikeFile(n) || (known && known.kind === 'file')) {
+        fileLinks.push(n.href);
+        if (rawKey !== n.href) this.redirects.set(rawKey, n.href); // tracking params / param order
+        continue;
+      }
+      pagePathFor[rawKey] = this.pageLocal(n);
       if (this.enqueue(n.href)) newLinks++;
     }
     // Fetch referenced assets the browser did not load (other srcset candidates, lazy images, file links).
+    const isKnownPage = (k) => { const n = U.normalizePageUrl(k); if (!n) return false; const r = this.pages.get(n.href); return n.href === canonicalHref || n.href === pageUrl || !!(r && r.kind !== 'file'); };
     const missing = [...new Set([...scan.refs.map((r) => (U.normalizeUrl(r) || {}).href), ...fileLinks])]
-      .filter((k) => k && !this.resolveLocal(k) && !this.failed.has(k));
+      .filter((k) => k && !this.resolveLocal(k) && !this.failed.has(k) && !isKnownPage(k));
     await mapLimit(missing, 6, (k) => this.fetchAsset(k, 'ref'));
 
     const html = await page.evaluate(B.rewriteDocument, {
@@ -343,20 +390,34 @@ class Crawler {
       await writeFileSafe(path.join(this.siteDir, '_mirror', 'map.js'), `window.__MIRROR_MAP=${JSON.stringify(map)};\n`);
     }
 
-    // Redirect stubs so every deterministic link target exists.
+    // Redirect stubs so every deterministic link target exists: aliases
+    // (redirects) and page-looking URLs that turned out to be files.
     const aliases = {};
-    for (const rec of this.pages.values()) {
-      if (rec.kind !== 'alias' || !rec.alias) continue;
-      const target = this.pages.get(rec.alias);
-      if (!target || !target.local) continue;
-      aliases[rec.url] = rec.alias;
-      const stubLocal = U.pageLocalPath(new URL(rec.url));
-      if (stubLocal === target.local || this.localPaths.has(stubLocal)) continue;
+    const writeStub = async (fromUrl, targetLocal, label) => {
+      const stubLocal = this.pageLocal(new URL(fromUrl));
+      if (stubLocal === targetLocal || this.pageLocals.has(stubLocal) || this.localPaths.has(stubLocal)) return null;
       const stubFile = path.join(this.siteDir, stubLocal);
-      if (fs.existsSync(stubFile)) continue;
-      const href = U.relativeHref(stubLocal, target.local);
-      await writeFileSafe(stubFile, `<!DOCTYPE html>\n<meta charset="utf-8"><meta http-equiv="refresh" content="0; url=${href}"><title>Redirecting</title><a href="${href}">${rec.alias}</a>\n`);
-      rec.local = stubLocal;
+      if (fs.existsSync(stubFile)) return null;
+      const href = U.relativeHref(stubLocal, targetLocal);
+      await writeFileSafe(stubFile, `<!DOCTYPE html>\n<meta charset="utf-8"><meta http-equiv="refresh" content="0; url=${href}"><title>Redirecting</title><a href="${href}">${label}</a>\n`);
+      return stubLocal;
+    };
+    for (const rec of this.pages.values()) {
+      if (rec.kind === 'alias' && rec.alias) {
+        const target = this.pages.get(rec.alias);
+        if (!target || !target.local) continue;
+        aliases[rec.url] = rec.alias;
+        const stub = await writeStub(rec.url, target.local, rec.alias);
+        if (stub) rec.local = stub;
+      } else if (rec.kind === 'file' && rec.local && !U.looksLikeFile(new URL(rec.url))) {
+        await writeStub(rec.url, rec.local, rec.url);
+      } else if (rec.kind === 'external-redirect' && rec.finalUrl) {
+        const stubLocal = this.pageLocal(new URL(rec.url));
+        if (!this.pageLocals.has(stubLocal) && !this.localPaths.has(stubLocal) && !fs.existsSync(path.join(this.siteDir, stubLocal))) {
+          await writeFileSafe(path.join(this.siteDir, stubLocal), `<!DOCTYPE html>\n<meta charset="utf-8"><meta http-equiv="refresh" content="0; url=${rec.finalUrl}"><title>Redirecting</title><a href="${rec.finalUrl}">${rec.finalUrl}</a>\n`);
+          rec.local = stubLocal;
+        }
+      }
     }
 
     const uncrawled = this.queue.filter((u) => { const r = this.pages.get(u); return r && !r.done; });

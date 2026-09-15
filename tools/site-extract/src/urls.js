@@ -32,7 +32,7 @@ const MIME_EXT = [
   [/^audio\/mpeg/, '.mp3'],
   [/^application\/pdf/, '.pdf'],
   [/^text\/plain/, '.txt'],
-  [/^text\/xml|^application\/xml/, '.xml'],
+  [/^text\/xml|^application\/xml|\+xml$/, '.xml'],
   [/^application\/manifest\+json/, '.webmanifest'],
 ];
 
@@ -42,11 +42,23 @@ function shortHash(s, n = 8) {
   return crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, n);
 }
 
+/**
+ * Filesystem-safe path segment. Injective enough for mirroring: when any
+ * character had to be replaced, a short hash of the original is appended
+ * (before the extension) so distinct segments never collapse onto one name.
+ */
 function sanitizeSegment(seg) {
-  let s = seg.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+$/, '_');
+  const m = seg.match(/^(.*?)(\.[A-Za-z0-9]{1,8})?$/);
+  let base = m[1];
+  let ext = m[2] || '';
+  if (!base) { base = ext; ext = ''; }
+  let s = base.replace(/[^A-Za-z0-9._-]+/g, '_');
+  if (/^\.+$/.test(s)) s = '_';
+  if (s !== base) s = (s.replace(/_+$/, '') || '_') + '-' + shortHash(seg, 6);
   if (WINDOWS_RESERVED.test(s.replace(/\..*$/, ''))) s = '_' + s;
-  if (s.length > 96) s = s.slice(0, 64) + '__' + shortHash(seg) + s.slice(-20).replace(/^[^.]*/, '');
-  return s || '_';
+  if (s.length > 96) s = s.slice(0, 64) + '__' + shortHash(seg);
+  const extSafe = ext.replace(/[^A-Za-z0-9.]/g, '');
+  return (s || '_') + extSafe;
 }
 
 function safeDecode(s) {
@@ -94,18 +106,25 @@ function looksLikeFile(u) {
   return FILE_EXT.test(u.pathname);
 }
 
-/** Deterministic local path (posix, relative to site root) for a page URL. */
-function pageLocalPath(u) {
+/**
+ * Deterministic local path (posix, relative to site root) for a page URL.
+ * `/` -> index.html, `/about` -> about/index.html, `/a/b.html` -> a/b.html,
+ * anything else with a dotted last segment (`/about.php`, `/team/j.smith`) is
+ * kept verbatim as a directory. Pages on a host other than the start host
+ * (subdomains, --allow-host, other ports) live under _hosts/<host>/.
+ */
+function pageLocalPath(u, startUrl) {
   const decoded = safeDecode(u.pathname).replace(/\/+$/, '');
   const segs = decoded.split('/').filter(Boolean).map(sanitizeSegment);
   let file = 'index.html';
   const last = segs[segs.length - 1];
-  if (last && /\.[a-z0-9]{1,6}$/i.test(last) && !/^\.+$/.test(last)) {
-    segs.pop();
-    file = /\.html?$/i.test(last) ? last : last.replace(/\.[^.]+$/, '') + '.html';
-  }
+  if (last && /\.html?$/i.test(last)) file = segs.pop();
   if (u.search) file = file.replace(/\.html?$/i, '') + '__q_' + shortHash(u.search) + '.html';
-  return path.posix.join(...segs, file);
+  const prefix = [];
+  if (startUrl && (registrableHost(u.hostname) !== registrableHost(startUrl.hostname) || u.port !== startUrl.port)) {
+    prefix.push('_hosts', sanitizeSegment(u.hostname + (u.port ? '_' + u.port : '')));
+  }
+  return path.posix.join(...prefix, ...segs, file);
 }
 
 function extFromContentType(ct) {
@@ -152,7 +171,7 @@ function rootPrefix(fromLocal) {
 }
 
 function slugForPage(localPath) {
-  const p = localPath.replace(/\/?index\.html$/, '').replace(/\.html$/, '');
+  const p = localPath.replace(/\/?index\.html$/, '').replace(/\.html$/, '').replace(/^_hosts\//, '');
   return p ? p.replace(/\//g, '__') : 'home';
 }
 
