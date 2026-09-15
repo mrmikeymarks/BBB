@@ -68,89 +68,134 @@ function scanPage() {
   // ---- text extraction ----------------------------------------------------
   const meta = (sel, attr = 'content') => { const el = document.querySelector(sel); return el ? (el.getAttribute(attr) || '').trim() : ''; };
   const clean = (s) => String(s || '').replace(/ /g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ').trim();
-  const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'IFRAME', 'HEAD', 'META', 'LINK', 'TITLE', 'OPTION']);
+  const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'IFRAME', 'HEAD', 'META', 'LINK', 'TITLE', 'OPTION', 'INPUT', 'TEXTAREA', 'SELECT']);
   const BLOCK_TAGS = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'P', 'LI', 'BLOCKQUOTE', 'PRE', 'TD', 'TH', 'FIGCAPTION', 'DT', 'DD', 'SUMMARY', 'CAPTION', 'BUTTON', 'LABEL', 'ADDRESS', 'LEGEND']);
+  const STRUCTURAL = 'h1,h2,h3,h4,h5,h6,ul,ol,table';
   const REGION_SEL = 'header, nav, footer, aside, main, article, [role="navigation"], [role="banner"], [role="contentinfo"], [role="main"], [role="complementary"]';
+  const parentOf = (n) => n.parentElement || (n.parentNode && n.parentNode.host) || null; // crosses shadow boundaries
   const regionOf = (el) => {
-    const r = el.closest(REGION_SEL); if (!r) return 'body';
+    let r = el.closest(REGION_SEL);
+    // header/footer are landmarks only outside article/aside/main/nav/section.
+    while (r && (r.tagName === 'HEADER' || r.tagName === 'FOOTER') && r.parentElement && r.parentElement.closest('article, aside, main, nav, section')) r = r.parentElement.closest(REGION_SEL);
+    if (!r) { const host = el.getRootNode && el.getRootNode().host; return host ? regionOf(host) : 'body'; }
     const role = (r.getAttribute('role') || '').toLowerCase();
     if (role === 'navigation') return 'nav'; if (role === 'banner') return 'header'; if (role === 'contentinfo') return 'footer';
     if (role === 'main') return 'main'; if (role === 'complementary') return 'aside';
     return r.tagName.toLowerCase();
   };
   const isHidden = (el) => {
-    for (let e = el; e && e !== document.documentElement; e = e.parentElement) {
-      if (SKIP.has(e.tagName)) return true;
+    for (let e = el; e && e !== document.documentElement; e = parentOf(e)) {
+      if (SKIP.has(e.tagName) && e !== el) return true;
+      if (SKIP.has(e.tagName) && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName)) return true;
       const cs = getComputedStyle(e);
       if (cs.display === 'none' || cs.visibility === 'hidden' || e.getAttribute('aria-hidden') === 'true') return true;
     }
     return false;
   };
-  const isBlockDisplay = (el) => /^(block|list-item|table|table-cell|table-row|flex|grid|inline-block|table-caption)$/.test(getComputedStyle(el).display);
+  const isBlockDisplay = (el) => /^(block|list-item|table|table-cell|table-row|table-caption|flex|grid|flow-root|-webkit-box)$/.test(getComputedStyle(el).display);
+  const isStandalone = (el) => el.tagName === 'A' || el.tagName === 'BUTTON' || /^inline-(block|flex|grid)$/.test(getComputedStyle(el).display);
 
-  const emitted = []; // { el, tag }
+  // While scanning: authored case instead of CSS text-transform, aria-hidden
+  // copies (icon fonts, split-text animation clones) out of the way, closed
+  // <details> opened so FAQ/accordion answers are captured. All restored after.
+  const tmpStyle = document.createElement('style');
+  tmpStyle.textContent = '*,*::before,*::after{text-transform:none!important}[aria-hidden="true"]{display:none!important}';
+  document.documentElement.appendChild(tmpStyle);
+  const closedDetails = [...document.querySelectorAll('details:not([open])')];
+  for (const d of closedDetails) d.open = true;
+  const inCollapsed = (el) => closedDetails.some((d) => d.contains(el));
+
+  const shadowHosts = [...document.querySelectorAll('*')].filter((e) => e.shadowRoot);
+  const roots = [{ root: document.body, host: null }, ...shadowHosts.map((h) => ({ root: h.shadowRoot, host: h }))];
+  const emitted = []; // { el, pos, tag, text? }
   const emittedSet = new Set();
-  const insideEmitted = (el) => { for (let e = el.parentElement; e; e = e.parentElement) if (emittedSet.has(e)) return true; return false; };
-  for (const el of document.body.querySelectorAll([...BLOCK_TAGS].join(','))) {
-    if (isHidden(el) || insideEmitted(el)) continue;
-    const text = clean(el.innerText);
-    if (!text) continue;
-    emitted.push({ el, tag: el.tagName.toLowerCase() }); emittedSet.add(el);
-  }
-  // Orphan text: visible text that is not inside any block tag (builder markup,
-  // links/spans placed directly in sections). Grouped by nearest block ancestor;
-  // hosts that also wrap emitted blocks contribute only their inline runs.
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  const hosts = new Set();
-  let node;
-  while ((node = walker.nextNode())) {
-    if (!node.nodeValue || !node.nodeValue.trim()) continue;
-    const parent = node.parentElement;
-    if (!parent || isHidden(parent) || emittedSet.has(parent) || insideEmitted(parent)) continue;
-    let host = parent;
-    while (host && host !== document.body && !isBlockDisplay(host)) host = host.parentElement;
-    hosts.add(host || document.body);
-  }
-  const emittedList = [...emittedSet];
-  const wrapsOthers = (el) => emittedList.some((e) => e !== el && el.contains(e)) || [...hosts].some((h) => h !== el && el.contains(h));
-  const textOf = (n) => (n.nodeType === 3 ? n.nodeValue : (n.nodeType === 1 && !isHidden(n) ? n.innerText : ''));
-  for (const host of hosts) {
-    if (!wrapsOthers(host)) { emitted.push({ el: host, pos: host, tag: host.tagName.toLowerCase() }); emittedSet.add(host); continue; }
-    let run = [];
-    const flush = () => {
-      if (run.length) {
-        const text = clean(run.map(textOf).join(''));
-        const els = run.filter((n) => n.nodeType === 1);
-        const single = els.length === 1 && !run.some((n) => n.nodeType === 3 && n.nodeValue.trim()) ? els[0] : null;
-        if (text) emitted.push({ el: single || els[0] || host, pos: run[0], tag: (single || host).tagName.toLowerCase(), text });
+  const insideEmitted = (el) => { for (let e = parentOf(el); e; e = parentOf(e)) if (emittedSet.has(e)) return true; return false; };
+  let blocks = [];
+  let headings = [];
+  let fullTextParts = [];
+  let linkList = [];
+  try {
+    for (const { root, host } of roots) {
+      const posOf = (n) => host || n;
+      // 1. Elements that are text blocks by markup. Containers that hold their
+      //    own structure (headings, lists, tables) are left to their children.
+      for (const el of root.querySelectorAll([...BLOCK_TAGS].join(','))) {
+        if (isHidden(el) || insideEmitted(el)) continue;
+        if (el.querySelector(STRUCTURAL)) continue;
+        if (!clean(el.innerText)) continue;
+        emitted.push({ el, pos: posOf(el), tag: el.tagName.toLowerCase() }); emittedSet.add(el);
       }
-      run = [];
-    };
-    for (const child of host.childNodes) {
-      if (child.nodeType === 3) { run.push(child); continue; }
-      if (child.nodeType !== 1) continue;
-      if (SKIP.has(child.tagName) || isHidden(child)) continue;
-      if (emittedSet.has(child) || isBlockDisplay(child) || wrapsOthers(child)) { flush(); continue; }
-      run.push(child);
+      // 2. Form controls carry their text in attributes.
+      for (const el of root.querySelectorAll('input[type="submit"],input[type="button"],input[type="reset"],input[placeholder],textarea[placeholder],select')) {
+        if (isHidden(el)) continue;
+        let tag = 'input'; let text = '';
+        if (el.tagName === 'SELECT') { tag = 'select'; text = [...el.options].map((o) => clean(o.textContent)).filter(Boolean).join(' | '); }
+        else if (/^(submit|button|reset)$/i.test(el.type)) { tag = 'button'; text = clean(el.value); }
+        else text = clean(el.getAttribute('placeholder'));
+        if (text) emitted.push({ el, pos: posOf(el), tag, text });
+      }
+      // 3. Everything else: text not inside a block tag, grouped by its nearest
+      //    block-level ancestor and split into inline runs.
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const hosts = new Set();
+      let node;
+      while ((node = walker.nextNode())) {
+        if (!node.nodeValue || !node.nodeValue.trim()) continue;
+        const parent = node.parentElement;
+        if (!parent || isHidden(parent) || emittedSet.has(parent) || insideEmitted(parent)) continue;
+        let h = parent;
+        while (h && h !== root && !(h.nodeType === 1 && isBlockDisplay(h))) h = h.parentElement;
+        hosts.add(h && h.nodeType === 1 ? h : (root.nodeType === 1 ? root : parent));
+      }
+      const emittedList = [...emittedSet];
+      const wrapsOthers = (el) => emittedList.some((e) => e !== el && el.contains(e)) || [...hosts].some((x) => x !== el && el.contains(x));
+      const textOf = (n) => (n.nodeType === 3 ? n.nodeValue : (n.nodeType === 1 && !isHidden(n) ? n.innerText : ''));
+      for (const hostEl of hosts) {
+        let run = [];
+        const runHasText = () => run.some((n) => n.nodeType === 3 && n.nodeValue.trim());
+        const flush = () => {
+          if (run.length) {
+            const text = clean(run.map(textOf).join(''));
+            const els = run.filter((n) => n.nodeType === 1);
+            const single = els.length === 1 && !runHasText() ? els[0] : null;
+            if (text) emitted.push({ el: single || els[0] || hostEl, pos: posOf(run[0]), tag: (single || hostEl).tagName.toLowerCase(), text });
+          }
+          run = [];
+        };
+        const visit = (child) => {
+          if (child.nodeType === 3) { run.push(child); return; }
+          if (child.nodeType !== 1 || SKIP.has(child.tagName) || isHidden(child)) return;
+          if (emittedSet.has(child) || isBlockDisplay(child)) { flush(); return; } // handled as its own block / host
+          if (wrapsOthers(child)) { flush(); for (const c of child.childNodes) visit(c); flush(); return; } // inline wrapper around blocks (card links)
+          if (isStandalone(child) && !runHasText()) { flush(); run.push(child); flush(); return; } // adjacent links / buttons
+          run.push(child);
+        };
+        for (const child of hostEl.childNodes) visit(child);
+        flush();
+      }
+      headings.push(...[...root.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter((h) => !isHidden(h)).map((h) => ({ level: +h.tagName[1], text: clean(h.innerText) })).filter((h) => h.text));
+      fullTextParts.push(clean(host ? [...root.children].filter((c) => !SKIP.has(c.tagName)).map((c) => c.innerText).join('\n') : document.body.innerText));
     }
-    flush();
-  }
-  for (const e of emitted) if (!e.pos) e.pos = e.el;
-  emitted.sort((a, b) => (a.pos === b.pos ? 0 : (a.pos.compareDocumentPosition(b.pos) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1));
-  const blocks = [];
-  for (const { el, tag, text: preText } of emitted) {
-    const text = preText !== undefined ? preText : clean(el.innerText);
-    if (!text) continue;
-    const b = { tag, region: regionOf(el), text };
-    const m = tag.match(/^h([1-6])$/); if (m) b.level = +m[1];
-    if (tag === 'li') b.list = el.parentElement && el.parentElement.tagName === 'OL' ? 'ol' : 'ul';
-    const a = tag === 'a' ? el : el.closest('a');
-    if (a) { const h = abs(a.getAttribute('href')); if (h) b.href = h; }
-    blocks.push(b);
+    emitted.sort((a, b) => (a.pos === b.pos ? 0 : (a.pos.compareDocumentPosition(b.pos) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1));
+    for (const { el, tag, text: preText } of emitted) {
+      const text = preText !== undefined ? preText : clean(el.innerText);
+      if (!text) continue;
+      const b = { tag, region: regionOf(el), text };
+      const m = tag.match(/^h([1-6])$/); if (m) b.level = +m[1];
+      if (tag === 'li') b.list = el.parentElement && el.parentElement.tagName === 'OL' ? 'ol' : 'ul';
+      const a = tag === 'a' ? el : el.closest('a');
+      if (a) { const h = abs(a.getAttribute('href')); if (h) b.href = h; }
+      else { const inner = el.querySelectorAll ? el.querySelectorAll('a[href]') : []; if (inner.length === 1 && clean(inner[0].innerText) === text) { const h = abs(inner[0].getAttribute('href')); if (h) b.href = h; } }
+      if (inCollapsed(el)) b.collapsed = true;
+      if (el.getRootNode && el.getRootNode() !== document) b.shadow = true;
+      blocks.push(b);
+    }
+    linkList = [...document.querySelectorAll('a[href]')].filter((a) => !isHidden(a)).map((a) => ({ text: clean(a.innerText) || clean(a.getAttribute('aria-label')) || clean(a.getAttribute('title')), href: abs(a.getAttribute('href')), region: regionOf(a) })).filter((l) => l.href);
+  } finally {
+    tmpStyle.remove();
+    for (const d of closedDetails) d.open = false;
   }
 
-  const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter((h) => !isHidden(h)).map((h) => ({ level: +h.tagName[1], text: clean(h.innerText) })).filter((h) => h.text);
-  const linkList = [...document.querySelectorAll('a[href]')].filter((a) => !isHidden(a)).map((a) => ({ text: clean(a.innerText) || clean(a.getAttribute('aria-label')) || clean(a.getAttribute('title')), href: abs(a.getAttribute('href')), region: regionOf(a) })).filter((l) => l.href);
   const images = [...document.querySelectorAll('img')].map((img) => ({ src: abs(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src')), alt: clean(img.getAttribute('alt')), width: img.naturalWidth || null, height: img.naturalHeight || null })).filter((i) => i.src);
   const jsonLd = [...document.querySelectorAll('script[type="application/ld+json"]')].map((s) => { try { return JSON.parse(s.textContent); } catch { return { _raw: s.textContent }; } });
   const metas = [...document.querySelectorAll('meta[name], meta[property]')].map((m) => ({ name: m.getAttribute('name') || m.getAttribute('property'), content: m.getAttribute('content') || '' })).filter((m) => m.content);
@@ -162,7 +207,7 @@ function scanPage() {
     canonical: (document.querySelector('link[rel="canonical"]') || {}).href || '',
     og: { title: meta('meta[property="og:title"]'), description: meta('meta[property="og:description"]'), image: meta('meta[property="og:image"]'), type: meta('meta[property="og:type"]') },
     metas, headings, blocks, links: linkList, images, jsonLd,
-    fullText: clean(document.body.innerText),
+    fullText: clean(fullTextParts.join('\n\n')),
   };
   return { links: [...links], refs: [...refs], content };
 }
@@ -229,6 +274,10 @@ function rewriteDocument(arg) {
   // the charset declaration must say so whatever the live page declared.
   for (const el of root.querySelectorAll('base, meta[http-equiv="Content-Security-Policy" i], meta[charset], meta[http-equiv="Content-Type" i]')) el.remove();
   const charset = document.createElement('meta'); charset.setAttribute('charset', 'utf-8'); headEl.insertBefore(charset, headEl.firstChild);
+  // Freeze the base URL at the page file so relative paths (and same-page
+  // anchors) keep resolving after an SPA router calls history.pushState().
+  const baseEl = document.createElement('base'); baseEl.setAttribute('href', pageLocal.split('/').pop()); baseEl.setAttribute('data-mirror', 'base');
+  headEl.insertBefore(baseEl, charset.nextSibling);
   if (stripScripts) for (const s of root.querySelectorAll('script')) { if ((s.getAttribute('type') || '').toLowerCase() !== 'application/ld+json') s.remove(); }
 
   const ATTRS = ['src', 'poster', 'data-src', 'data-lazy-src', 'data-original', 'data-bg', 'data-background'];
@@ -276,7 +325,7 @@ function rewriteDocument(arg) {
     const shim = document.createElement('script');
     shim.setAttribute('src', rootPrefix + '_mirror/shim.js');
     shim.setAttribute('data-mirror', 'shim');
-    const anchor = charset.nextSibling;
+    const anchor = baseEl.nextSibling;
     head.insertBefore(cfg, anchor);
     head.insertBefore(mapScript, anchor);
     head.insertBefore(shim, anchor);

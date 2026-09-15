@@ -31,7 +31,8 @@ const DEFAULTS = {
   screenshots: true,
   sitemap: true,
   headless: true,
-  proxy: null,
+  proxy: process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || null,
+  proxyBypass: process.env.NO_PROXY || process.env.no_proxy || null,
   chromium: process.env.SITE_EXTRACT_CHROMIUM || null,
   userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
   viewport: { width: 1366, height: 900 },
@@ -82,6 +83,26 @@ class Crawler {
 
   isSameSite(u) { return U.isSameSite(u, this.start, this.opts); }
   pageLocal(u) { return U.pageLocalPath(u, this.start); }
+
+  /** Map www/bare-host and http/https variants of the site onto one origin. */
+  canonPage(n) {
+    if (this.canonical && n.port === this.start.port && U.registrableHost(n.hostname) === U.registrableHost(this.start.hostname)) {
+      n.protocol = this.canonical.protocol; n.hostname = this.canonical.hostname;
+    }
+    return n;
+  }
+
+  async resolveCanonicalOrigin() {
+    this.canonical = { protocol: this.start.protocol, hostname: this.start.hostname };
+    try {
+      const r = await this.request.get(this.start.href, { timeout: this.opts.timeout, maxRedirects: 10, headers: { 'user-agent': this.opts.userAgent } });
+      const f = U.normalizePageUrl(r.url());
+      if (f && U.registrableHost(f.hostname) === U.registrableHost(this.start.hostname) && f.port === this.start.port) {
+        this.canonical = { protocol: f.protocol, hostname: f.hostname };
+        if (f.origin !== this.start.origin) this.log(`[start] ${this.start.origin} serves from ${f.origin}; using that as the canonical origin`);
+      }
+    } catch (e) { this.log(`[warn] could not fetch the start URL: ${firstLine(e)}`); }
+  }
 
   enqueue(href) {
     if (this.pages.has(href)) return false;
@@ -166,9 +187,11 @@ class Crawler {
       if (rt === 'document') return;
       if (status < 200 || status >= 300 || status === 204 || status === 206) return; // 206: range request, partial body
       if (this.assets.has(key)) return;
-      this.assets.set(key, { pending: true });
+      const placeholder = { pending: true };
+      this.assets.set(key, placeholder);
       let body;
-      try { body = await resp.body(); } catch (e) { this.assets.delete(key); return; }
+      try { body = await resp.body(); } catch (e) { if (this.assets.get(key) === placeholder) this.assets.delete(key); return; }
+      if (this.assets.get(key) !== placeholder) return; // fetchAsset stored the real record meanwhile
       if (body.length > this.opts.maxAssetBytes) { this.assets.delete(key); this.failed.set(key, 'too large'); return; }
       // Chromium hands back an empty body for prefetches and for images it could
       // not decode; leave those to the follow-up fetch pass instead of saving junk.
@@ -216,7 +239,7 @@ class Crawler {
     try {
       const r = await this.request.get(new URL('/robots.txt', this.start).href, { timeout: this.opts.timeout });
       if (r.ok()) for (const m of (await r.text()).matchAll(/^\s*sitemap:\s*(\S+)/gim)) sitemaps.push(m[1]);
-    } catch { /* no robots */ }
+    } catch (e) { this.log(`[sitemap] robots.txt not read: ${firstLine(e)}`); }
     let added = 0;
     while (sitemaps.length && seen.size < 50) {
       const sm = sitemaps.shift();
@@ -225,15 +248,21 @@ class Crawler {
       try {
         const r = await this.request.get(sm, { timeout: this.opts.timeout });
         if (!r.ok()) continue;
-        const xml = await r.text();
+        let xml;
+        const ct = (r.headers()['content-type'] || '').toLowerCase();
+        if (/\.gz(\?|$)/i.test(sm) || /gzip/.test(ct)) { try { xml = require('zlib').gunzipSync(await r.body()).toString('utf8'); } catch { xml = await r.text(); } }
+        else xml = await r.text();
         const isIndex = /<sitemapindex/i.test(xml);
-        for (const m of xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) {
+        let found = 0;
+        for (const m of xml.matchAll(/<loc>\s*(?:<!\[CDATA\[)?\s*([^<\s\]]+)\s*(?:\]\]>)?\s*<\/loc>/gi)) {
+          found++;
           const loc = m[1].replace(/&amp;/g, '&');
           if (isIndex) { sitemaps.push(loc); continue; }
           const n = U.normalizePageUrl(loc);
-          if (n && this.isSameSite(n) && !U.looksLikeFile(n) && this.enqueue(n.href)) added++;
+          if (n && this.isSameSite(n) && !U.looksLikeFile(n) && this.enqueue(this.canonPage(n).href)) added++;
         }
-      } catch { /* skip */ }
+        if (!found) this.log(`[sitemap] ${sm}: no <loc> entries`);
+      } catch (e) { this.log(`[sitemap] ${sm}: ${firstLine(e)}`); }
     }
     if (added) this.log(`[sitemap] seeded ${added} URLs from ${seen.size} sitemap(s)`);
   }
@@ -273,14 +302,19 @@ class Crawler {
       }
     }
     const finalU = U.normalizePageUrl(page.url());
+    if (!finalU) { rec.error = resp ? 'navigation did not commit' : 'navigation did not commit (timeout)'; rec.done = true; return rec; }
     rec.finalUrl = finalU.href;
     let canonicalHref = pageUrl;
     if (finalU.href !== pageUrl) {
       if (!this.isSameSite(finalU)) { rec.kind = 'external-redirect'; rec.done = true; return rec; }
+      this.canonPage(finalU);
+    }
+    if (finalU.href !== pageUrl) {
       rec.kind = 'alias'; rec.alias = finalU.href; rec.done = true;
       const target = this.pages.get(finalU.href);
-      if (target && target.done) return rec;
-      if (!target) this.pages.set(finalU.href, { url: finalU.href, done: false });
+      if (target && (target.done || target.started)) return rec; // crawled, or another tab is on it
+      if (!target) this.pages.set(finalU.href, { url: finalU.href, done: false, started: true });
+      else target.started = true;
       canonicalHref = finalU.href;
     }
     const canon = this.pages.get(canonicalHref);
@@ -305,6 +339,7 @@ class Crawler {
     for (const raw of scan.links) {
       const n = U.normalizePageUrl(raw);
       if (!n || !this.isSameSite(n)) continue;
+      this.canonPage(n);
       const rawKey = raw.replace(/#.*$/, '');
       const known = this.pages.get(n.href);
       if (U.looksLikeFile(n) || (known && known.kind === 'file')) {
@@ -350,15 +385,18 @@ class Crawler {
     const workers = Array.from({ length: n }, async () => {
       let page = await this.context.newPage();
       for (;;) {
-        if (this.pagesDone >= this.opts.maxPages) break;
+        if (this.pagesDone + active >= this.opts.maxPages) break; // pages in flight count against the budget
         if (this.queue.length === 0) { if (active === 0) break; await sleep(200); continue; }
         const url = this.queue.shift();
         const rec = this.pages.get(url);
-        if (!rec || rec.done) continue;
+        if (!rec || rec.done || rec.started) continue;
+        rec.started = true;
         active++;
         try { await this.processPage(url, page); }
         catch (e) {
           rec.error = firstLine(e); rec.done = true;
+          const target = rec.alias && this.pages.get(rec.alias);
+          if (target && !target.done) { target.error = rec.error; target.done = true; target.local = null; }
           this.log(`[error] ${url}: ${rec.error}`);
           if (page.isClosed()) page = await this.context.newPage();
         } finally { active--; }
@@ -380,6 +418,7 @@ class Crawler {
     }
     for (const [cssUrl, text] of this.cssText) {
       const rec = this.assets.get(cssUrl);
+      if (!rec || !rec.local) continue;
       await writeFileSafe(path.join(this.siteDir, rec.local), rewriteCss(text, cssUrl, rec.local, (k) => this.resolveLocal(k)));
     }
     await Promise.all([...this.assets.values()].map((a) => a.write).filter(Boolean));
@@ -405,7 +444,7 @@ class Crawler {
     for (const rec of this.pages.values()) {
       if (rec.kind === 'alias' && rec.alias) {
         const target = this.pages.get(rec.alias);
-        if (!target || !target.local) continue;
+        if (!target || !target.local || target.error || !fs.existsSync(path.join(this.siteDir, target.local))) continue;
         aliases[rec.url] = rec.alias;
         const stub = await writeStub(rec.url, target.local, rec.alias);
         if (stub) rec.local = stub;
@@ -441,20 +480,24 @@ class Crawler {
 
     this.contents.sort((a, b) => a.local.localeCompare(b.local));
     await writeFileSafe(path.join(this.contentDir, 'all-pages.json'), JSON.stringify(this.contents, null, 2));
-    await writeFileSafe(path.join(this.contentDir, 'all-pages.md'), this.contents.map(toMarkdown).join('\n\n---\n\n') + '\n');
+    await writeFileSafe(path.join(this.contentDir, 'all-pages.md'), allPagesMarkdown(this.contents));
     await writeFileSafe(path.join(this.contentDir, 'index.json'), JSON.stringify(this.contents.map((c) => ({ url: c.url, slug: c.slug, title: c.title, description: c.description, headings: c.headings.length, blocks: c.blocks.length, words: c.fullText.split(/\s+/).filter(Boolean).length, json: `content/pages/${c.slug}.json`, markdown: `content/pages/${c.slug}.md` })), null, 2));
     return manifest;
   }
 
   async run() {
     await fsp.mkdir(this.siteDir, { recursive: true });
-    this.browser = await chromium.launch({ headless: this.opts.headless, executablePath: this.opts.chromium || undefined, proxy: this.opts.proxy ? { server: this.opts.proxy } : undefined });
+    // The same proxy is given to the browser and to the API request context
+    // (used for sitemaps and asset fetches), which does not read env vars itself.
+    const proxy = this.opts.proxy ? { server: this.opts.proxy, bypass: this.opts.proxyBypass || undefined } : undefined;
+    this.browser = await chromium.launch({ headless: this.opts.headless, executablePath: this.opts.chromium || undefined, proxy });
     this.context = await this.browser.newContext({ userAgent: this.opts.userAgent, viewport: this.opts.viewport, ignoreHTTPSErrors: true, serviceWorkers: 'block', bypassCSP: true });
     this.request = this.context.request;
     this.context.on('response', (r) => { this.onResponse(r); });
     try {
-      this.enqueue(this.start.href);
-      for (const s of this.opts.seeds) { const n = U.normalizePageUrl(s, this.start); if (n && this.isSameSite(n)) this.enqueue(n.href); }
+      await this.resolveCanonicalOrigin();
+      this.enqueue(this.canonPage(new URL(this.start.href)).href);
+      for (const s of this.opts.seeds) { const n = U.normalizePageUrl(s, this.start); if (n && this.isSameSite(n)) this.enqueue(this.canonPage(n).href); }
       if (this.opts.sitemap) await this.seedFromSitemaps();
       await this.runWorkers();
       return await this.finalize();
@@ -464,23 +507,40 @@ class Crawler {
   }
 }
 
-function toMarkdown(c) {
-  const lines = [`# ${c.title || c.url}`, '', `Source: ${c.url}`, ''];
-  if (c.description) lines.push(`> ${c.description}`, '');
+const SHARED_REGIONS = new Set(['header', 'nav', 'footer']);
+
+/** Markdown for one page. `regions` limits which page regions are rendered. */
+function toMarkdown(c, { regions = null, title = true } = {}) {
+  const lines = [];
+  if (title) lines.push(`# ${c.title || c.url}`, '', `Source: ${c.url}`, '');
+  if (title && c.description) lines.push(`> ${c.description}`, '');
+  const link = (text, href) => (/[\n\]]/.test(text) ? `${text} <${href}>` : `[${text}](${href})`);
   let region = null;
   for (const b of c.blocks) {
+    if (regions && !regions.has(b.region)) continue;
     if (b.region !== region) { region = b.region; lines.push(`<!-- ${region} -->`, ''); }
-    const text = b.href && b.tag !== 'li' ? `[${b.text}](${b.href})` : b.text;
-    if (b.level) lines.push('#'.repeat(b.level) + ' ' + b.text);
-    else if (b.tag === 'li') lines.push((b.list === 'ol' ? '1. ' : '- ') + (b.href ? `[${b.text}](${b.href})` : b.text));
+    const text = b.href ? link(b.text, b.href) : b.text;
+    if (b.level) lines.push('#'.repeat(Math.min(6, b.level + 1)) + ' ' + b.text); // page title is the only H1
+    else if (b.tag === 'li') lines.push((b.list === 'ol' ? '1. ' : '- ') + text);
     else if (b.tag === 'blockquote') lines.push('> ' + b.text.replace(/\n/g, '\n> '));
     else if (b.tag === 'pre') lines.push('```', b.text, '```');
     else if (b.tag === 'button') lines.push(`[Button: ${b.text}]`);
+    else if (b.tag === 'input' || b.tag === 'select') lines.push(`[${b.tag}: ${b.text}]`);
     else lines.push(text);
     lines.push('');
   }
-  if (c.images && c.images.length) { lines.push('## Images', ''); for (const i of c.images) lines.push(`- ![${i.alt}](${i.src})`); lines.push(''); }
+  if (title && c.images && c.images.length) { lines.push('## Images', ''); for (const i of c.images) lines.push(`- ![${i.alt}](${i.src})`); lines.push(''); }
   return lines.join('\n');
+}
+
+/** all-pages.md: shared chrome (header/nav/footer) once, then each page's own content. */
+function allPagesMarkdown(contents) {
+  if (!contents.length) return '';
+  const first = contents.find((c) => c.slug === 'home') || contents[0];
+  const own = new Set(['main', 'article', 'aside', 'body', 'section']);
+  const out = [`# ${first.title || first.url}`, '', `Site content extracted by site-extract. Header, navigation and footer are shown once (from ${first.url}); each page below lists only its own content.`, '', '## Shared header, navigation and footer', '', toMarkdown(first, { regions: SHARED_REGIONS, title: false })];
+  for (const c of contents) out.push('', '---', '', `## ${c.title || c.url}`, '', `Source: ${c.url}`, '', c.description ? `> ${c.description}\n` : '', toMarkdown(c, { regions: own, title: false }).replace(/^(#+) /gm, (m, h) => '#'.repeat(Math.min(6, h.length + 1)) + ' '));
+  return out.join('\n') + '\n';
 }
 
 function parseArgs(argv) {
@@ -505,6 +565,7 @@ function parseArgs(argv) {
       case '--no-sitemap': opts.sitemap = false; break;
       case '--headed': opts.headless = false; break;
       case '--proxy': opts.proxy = next(); break;
+      case '--no-proxy': opts.proxy = null; break;
       case '--chromium': opts.chromium = next(); break;
       case '--user-agent': opts.userAgent = next(); break;
       case '--viewport': { const [w, h] = next().split('x').map(Number); opts.viewport = { width: w, height: h }; break; }
@@ -532,7 +593,8 @@ Options:
   --no-screenshots        Skip full-page PNGs
   --no-sitemap            Do not seed from robots.txt / sitemap.xml
   --headed                Show the browser window
-  --proxy <url>           HTTP(S) proxy for the browser and fetches
+  --proxy <url>           HTTP(S) proxy for the browser and fetches (default: $HTTPS_PROXY)
+  --no-proxy              Ignore proxy environment variables
   --chromium <path>       Use this Chromium/Chrome binary (or env SITE_EXTRACT_CHROMIUM)
   --user-agent <ua>       Override the User-Agent
   --viewport <WxH>        Browser viewport (default 1366x900)
@@ -555,9 +617,14 @@ if (require.main === module) {
     if (parsed.opts.help || parsed.pos.length !== 1) { console.error(HELP); process.exit(parsed.opts.help ? 0 : 2); }
     const manifest = await crawl(parsed.pos[0], parsed.opts);
     const c = manifest.counts;
+    if (!c.pages) {
+      const first = manifest.pages[0];
+      console.error(`No pages could be crawled${first && first.error ? ': ' + first.error : ''}`);
+      process.exit(3);
+    }
     console.error(`\nDone: ${c.pages} pages, ${c.files} files, ${c.aliases} redirects, ${c.assets} assets, ${c.failed} failed, ${c.uncrawled} uncrawled`);
     console.error(`Output: ${manifest.options.out}`);
   })().catch((e) => { console.error(e); process.exit(1); });
 }
 
-module.exports = { crawl, Crawler, toMarkdown, parseArgs };
+module.exports = { crawl, Crawler, toMarkdown, allPagesMarkdown, parseArgs };

@@ -84,7 +84,7 @@ async function main() {
   assert.ok(home.includes(`imagesrcset="${A}/img/a.png 1x, ${A}/img/${A2X} 2x"`), 'imagesrcset rewritten');
   assert.ok(home.includes(`href="fb/index.html"`) && read(path.join(site, 'fb/index.html')).includes('url=https://external.example.org/fb'), 'external redirect stub');
   assert.ok(home.includes(`href="download/index.html"`) && /url=\.\.\/_assets\/[^"]*\/download\.bin"?/.test(read(path.join(site, 'download/index.html'))) || read(path.join(site, 'download/index.html')).includes('_assets/'), `download stub: ${read(path.join(site, 'download/index.html'))}`);
-  assert.ok(home.startsWith('<!DOCTYPE html>') && /<head><meta charset="utf-8"><script data-mirror="config">/.test(home), `charset meta first, then shim: ${home.slice(0, 200)}`);
+  assert.ok(home.startsWith('<!DOCTYPE html>') && /<head><meta charset="utf-8"><base href="index.html" data-mirror="base"><script data-mirror="config">/.test(home), `charset meta, frozen base, then shim: ${home.slice(0, 260)}`);
   const latin = fs.readFileSync(path.join(site, 'latin.html'));
   assert.ok(latin.toString('utf8').includes('<meta charset="utf-8">') && !latin.toString('utf8').includes('iso-8859-1') && latin.toString('utf8').includes('Café crème €'), 'latin-1 page re-declared as utf-8 with intact text');
   assert.ok(home.includes(`href="team/john.smith/index.html"`) && home.includes(`href="team/john.doe/index.html"`), 'dotted slugs kept distinct');
@@ -105,6 +105,7 @@ async function main() {
   assert.ok(home.includes('application/ld+json'), 'JSON-LD kept');
   const services = read(path.join(site, 'services/index.html'));
   assert.ok(services.includes(`window.__MIRROR_ORIGIN="${origin}/services/"`), `shim origin keeps the trailing slash: ${services.match(/__MIRROR_ORIGIN="[^"]*"/)}`);
+  assert.ok(services.includes('<base href="index.html" data-mirror="base">') && read(path.join(site, 'about.html')).includes('<base href="about.html" data-mirror="base">'), 'base tag names the page file');
   assert.ok(services.includes(`href="../${A}/css/main.css"`), 'nested page uses ../ asset path');
   assert.ok(services.includes(`href="../index.html"`) && services.includes(`href="../about.html"`), 'nested page links rewritten');
   assert.ok(services.includes(`href="../${A}/img/sprite.svg#icon-leaf"`), 'svg <use> rewritten with fragment');
@@ -130,7 +131,7 @@ async function main() {
   const homeJson = JSON.parse(read(path.join(out, 'content/pages/home.json')));
   assert.strictEqual(homeJson.title, 'Fixture Travel Co - Home');
   assert.strictEqual(homeJson.description, 'Fixture Travel Co plans curated regenerative trips.');
-  assert.deepStrictEqual(homeJson.headings, [{ level: 1, text: 'Travel that gives back' }, { level: 2, text: 'Featured destinations' }]);
+  assert.deepStrictEqual(homeJson.headings, [{ level: 1, text: 'Travel that gives back' }, { level: 2, text: 'Featured destinations' }, { level: 3, text: 'Card title' }, { level: 3, text: 'Feature one' }, { level: 2, text: 'Split Title' }, { level: 2, text: 'Post header inside article' }]);
   const texts = homeJson.blocks.map((b) => b.text);
   assert.ok(texts.includes('We design small-group trips that leave places better than we found them.'), 'paragraph extracted');
   assert.ok(texts.includes('Coast walk') && texts.includes('Wetland stay'), `JS-rendered list items extracted: ${JSON.stringify(texts)}`);
@@ -140,14 +141,40 @@ async function main() {
   assert.ok(!homeJson.fullText.includes('must not be extracted'), 'hidden text excluded from fullText');
   assert.ok(homeJson.blocks.find((b) => b.tag === 'button' && b.text === 'Get a quote'), 'button captured');
   assert.ok(homeJson.blocks.find((b) => b.tag === 'blockquote'), 'blockquote captured');
-  assert.strictEqual(homeJson.blocks.find((b) => b.text === 'Home').region, 'nav', 'nav region tagged');
+  assert.strictEqual(homeJson.blocks.find((b) => b.text === 'Home').region, 'nav', 'nav region tagged (and text-transform not applied)');
+  assert.ok(!texts.includes('HOME') && !homeJson.fullText.includes('ABOUT US'), 'CSS text-transform not baked into the extraction');
+  const cta = homeJson.blocks.filter((b) => b.text === 'Book now' || b.text === 'Learn more');
+  assert.deepStrictEqual(cta.map((b) => [b.tag, b.href]), [['a', `${origin}/services/`], ['a', `${origin}/about.html`]], `adjacent links are separate blocks: ${JSON.stringify(texts.filter((t) => /Book|Learn/.test(t)))}`);
+  const card = homeJson.blocks.filter((b) => /^(12 May 2026|Card title|Card excerpt text\.)$/.test(b.text));
+  assert.deepStrictEqual(card.map((b) => b.text), ['12 May 2026', 'Card title', 'Card excerpt text.'], `inline card link keeps its eyebrow text: ${JSON.stringify(card)}`);
+  assert.strictEqual(card[0].href, `${origin}/blog/post-1/`, 'eyebrow run inherits the card link');
+  assert.ok(homeJson.blocks.find((b) => b.tag === 'h3' && b.text === 'Feature one' && b.level === 3), 'heading inside <li> is its own block');
+  assert.ok(homeJson.blocks.find((b) => b.tag === 'p' && b.text === 'Feature one detail.'), 'paragraph inside <li> is its own block');
+  assert.ok(homeJson.blocks.find((b) => b.tag === 'li' && b.text === 'Plain feature' && b.list === 'ul'), 'simple <li> still a list item');
+  assert.strictEqual(homeJson.blocks.filter((b) => b.text === 'Split Title').length, 1, 'aria-hidden split-text clone deduplicated');
+  assert.ok(homeJson.blocks.find((b) => b.tag === 'summary' && b.text === 'What is included?'), 'details summary');
+  const answer = homeJson.blocks.find((b) => b.text === 'Flights, lodging and guides are included.');
+  assert.ok(answer && answer.collapsed === true, `closed <details> content extracted and flagged: ${JSON.stringify(answer)}`);
+  assert.ok(homeJson.blocks.find((b) => b.tag === 'input' && b.text === 'Your email'), 'placeholder extracted');
+  assert.ok(homeJson.blocks.find((b) => b.tag === 'select' && b.text === 'Coast | Mountain'), 'select options extracted');
+  assert.ok(homeJson.blocks.find((b) => b.tag === 'button' && b.text === 'Send request'), 'submit value extracted');
+  assert.strictEqual(homeJson.blocks.find((b) => b.text === 'Post header inside article').region, 'article', 'header inside article is not the page header');
+  assert.strictEqual(homeJson.blocks.find((b) => b.text === 'Article footer note').region, 'article', 'footer inside article is not the page footer');
+  const shadow = homeJson.blocks.find((b) => b.text === 'Shadow widget text');
+  assert.ok(shadow && shadow.shadow === true && shadow.tag === 'p', `shadow DOM text extracted: ${JSON.stringify(shadow)}`);
+  assert.ok(homeJson.fullText.includes('Shadow widget text'), 'shadow text in fullText');
+  const navHome = homeJson.blocks.find((b) => b.tag === 'li' && b.text === 'Home');
+  assert.strictEqual(navHome.href, `${origin}/`, 'list item takes the href of its single link');
   assert.strictEqual(homeJson.blocks.find((b) => b.text.startsWith('©')).region, 'footer', 'footer region tagged');
   assert.ok(homeJson.images.find((i) => i.alt === 'Lazy loaded mountain'), 'lazy image listed');
   assert.ok(homeJson.images.find((i) => i.alt === 'Dynamically inserted'), 'dynamic image listed');
   assert.strictEqual(homeJson.jsonLd[0]['@type'], 'TravelAgency');
   assert.ok(homeJson.links.find((l) => l.text === 'Partner' && l.href === 'https://external.example.org/partner'));
   const md = read(path.join(out, 'content/pages/home.md'));
-  assert.ok(md.startsWith('# Fixture Travel Co - Home') && md.includes('# Travel that gives back') && md.includes('- Coast walk') && md.includes('[Button: Get a quote]'), 'markdown rendering');
+  assert.ok(md.startsWith('# Fixture Travel Co - Home') && md.includes('\n## Travel that gives back') && !md.includes('\n# Travel that gives back') && md.includes('- Coast walk') && md.includes('[Button: Get a quote]') && md.includes(`- [Home](${origin}/)`), `markdown rendering: ${md.slice(0, 400)}`);
+  const allMd = read(path.join(out, 'content/all-pages.md'));
+  assert.strictEqual((allMd.match(/\[Legacy link\]/g) || []).length, 1, 'all-pages.md renders the shared nav once');
+  assert.ok(allMd.includes('### Travel that gives back') && allMd.includes('## Services - Fixture Travel Co'), 'all-pages.md demotes page headings under page titles');
   const aboutJson = JSON.parse(read(path.join(out, 'content/pages/about.json')));
   assert.ok(aboutJson.blocks.find((b) => b.tag === 'li' && b.list === 'ol' && b.text === 'Alex, founder'), 'ordered list items');
   const svc = JSON.parse(read(path.join(out, 'content/pages/services.json')));
@@ -187,6 +214,23 @@ async function main() {
     assert.deepStrictEqual(failed, [], 'nested page stays inside the mirror');
     await page.waitForFunction(() => document.getElementById('rel-fetch').textContent !== 'pending', null, { timeout: 5000 });
     assert.strictEqual(await page.textContent('#rel-fetch'), 'rel-fetch:true', 'relative fetch on a directory page resolves through the shim');
+    // SPA-style navigation: after pushState every runtime load must still hit the mirror.
+    await page.evaluate(() => history.pushState({}, '', '/services/deep/route'));
+    const afterPush = await page.evaluate(async () => {
+      const r = await fetch(new URL('/api/data.json', location.origin)); // URL object built from the mirror's own origin
+      const j = await r.json();
+      const p = await fetch('/api/xhr.json', { method: 'POST', body: '{}' }); // captured response served to a POST
+      const pj = await p.json();
+      const img = new Image();
+      const loaded = new Promise((res) => { img.onload = () => res('ok'); img.onerror = () => res('err'); });
+      img.src = '/img/real.png';
+      const x = await new Promise((res) => { const xhr = new XMLHttpRequest(); xhr.open('POST', 'data.json'); xhr.onload = () => res(JSON.parse(xhr.responseText).ok); xhr.onerror = () => res('err'); xhr.send('{}'); });
+      const a = document.createElement('a'); a.href = 'index.html';
+      return { items: j.items.length, post: pj.ok, img: await loaded, imgSrc: img.src, xhr: x, sw: 'serviceWorker' in navigator, anchor: a.href };
+    });
+    assert.deepStrictEqual(afterPush, { items: 3, post: true, img: 'ok', imgSrc: `${mirror.origin}/${A}/img/real.png`, xhr: true, sw: false, anchor: `${mirror.origin}/services/index.html` }, 'runtime loads after pushState');
+    assert.deepStrictEqual(bad, [], `broken requests after pushState: ${bad.join(', ')}`);
+    await page.goBack();
 
     await page.click('text=Home');
     await page.waitForURL('**/index.html');
@@ -195,6 +239,20 @@ async function main() {
     assert.ok(stubResp === null || stubResp.ok(), 'file stub page served');
     assert.ok(read(path.join(site, 'menu/index.html')).includes(`url=../${A}/menu.pdf`), 'file stub forwards to the captured PDF');
   } finally { await browser.close(); mirror.server.close(); }
+
+  // ---- page budget and CLI exit status -------------------------------------
+  const fixture3 = await start();
+  const out3 = fs.mkdtempSync(path.join(os.tmpdir(), 'site-extract-test-budget-'));
+  try {
+    const m3 = await crawl(fixture3.origin + '/', { out: out3, concurrency: 3, delay: 0, wait: 200, timeout: 15000, screenshots: false, maxPages: 2, log: () => {} });
+    assert.strictEqual(m3.counts.pages, 2, `--max-pages is a hard cap even with concurrency: ${m3.counts.pages}`);
+    assert.ok(m3.uncrawled.length > 0, 'uncrawled URLs reported');
+  } finally { fixture3.server.close(); fs.rmSync(out3, { recursive: true, force: true }); }
+  const { spawnSync } = require('child_process');
+  const cli = spawnSync(process.execPath, [path.join(__dirname, '../src/crawl.js'), 'http://127.0.0.1:9/', '--out', path.join(os.tmpdir(), 'site-extract-test-unreachable'), '--timeout', '5000', '--no-sitemap', '--no-screenshots'], { encoding: 'utf8', env: { ...process.env } });
+  assert.strictEqual(cli.status, 3, `CLI exits 3 when nothing could be crawled (got ${cli.status}): ${cli.stderr.slice(-400)}`);
+  assert.ok(/No pages could be crawled/.test(cli.stderr), 'CLI explains the failure');
+  fs.rmSync(path.join(os.tmpdir(), 'site-extract-test-unreachable'), { recursive: true, force: true });
 
   // ---- strip-scripts variant ----------------------------------------------
   const fixture2 = await start();

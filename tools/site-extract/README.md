@@ -49,7 +49,7 @@ Serve it rather than double-clicking `index.html`: browsers block `fetch()` from
 | `--no-screenshots` | off | Skip full-page PNGs |
 | `--no-sitemap` | off | Do not seed from `robots.txt` / `sitemap.xml` |
 | `--headed` | off | Show the browser |
-| `--proxy <url>` | | HTTP(S) proxy for the browser and asset fetches |
+| `--proxy <url>` | `$HTTPS_PROXY` | HTTP(S) proxy for the browser and asset fetches (`--no-proxy` ignores the environment) |
 | `--chromium <path>` | Playwright's Chromium | Use an existing Chromium/Chrome binary instead (also env `SITE_EXTRACT_CHROMIUM`) |
 | `--user-agent <ua>` | Chrome UA | Override the User-Agent |
 | `--viewport <WxH>` | 1366x900 | Browser viewport |
@@ -73,7 +73,7 @@ Serve it rather than double-clicking `index.html`: browsers block `fetch()` from
   screenshots/<slug>.png   full-page screenshots
 ```
 
-Page slugs derive from the path: `/` is `home`, `/about` is `about`, `/blog/post-1` is `blog__post-1`.
+Page slugs derive from the path: `/` is `home`, `/about` is `about`, `/blog/post-1` is `blog__post-1`. `all-pages.md` shows the shared header, navigation and footer once, then each page's own content with headings demoted under the page title. The CLI exits with status 3 when no page could be crawled.
 
 ### Per-page JSON
 
@@ -92,7 +92,7 @@ Page slugs derive from the path: `/` is `home`, `/about` is `about`, `/blog/post
 }
 ```
 
-`region` is one of `header`, `nav`, `main`, `article`, `aside`, `footer`, `body`, taken from the nearest landmark ancestor. Hidden elements (`display:none`, `visibility:hidden`, `hidden`, `aria-hidden`) are excluded.
+`region` is one of `header`, `nav`, `main`, `article`, `aside`, `footer`, `body`, taken from the nearest landmark ancestor (a `header`/`footer` inside an article or section is not a page landmark). Blocks are emitted in DOM order: block-level elements as units, and any other visible text grouped by its nearest block ancestor and split into inline runs, so adjacent links or buttons stay separate and a card link keeps its eyebrow text. Text is captured as authored (CSS `text-transform` is not applied). Hidden elements (`display:none`, `visibility:hidden`, `hidden`, `aria-hidden`) are excluded; content of closed `<details>` is included and flagged `collapsed: true`; text inside open shadow roots is included and flagged `shadow: true`; form controls contribute their submit value, placeholder or option list. A block whose text is a single link carries that link's `href`.
 
 ## How the mirror works
 

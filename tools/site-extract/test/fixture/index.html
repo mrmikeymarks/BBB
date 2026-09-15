@@ -13,7 +13,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com">
 <link rel="prefetch" href="/about.html">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"TravelAgency","name":"Fixture Travel Co"}</script>
-<style>.hero { background-image: url("/img/hero.png"); }</style>
+<style>.hero { background-image: url("/img/hero.png"); } nav a { text-transform: uppercase; } .sr-only { position:absolute; left:-9999px; }</style>
 <style id="cssom"></style>
 <script>document.getElementById('cssom').sheet.insertRule('.cssom-card { background-image: url("/img/bg.png"); color: rebeccapurple; }', 0);</script>
 <link rel="preload" as="image" imagesrcset="/img/a.png 1x, /img/a@2x.png 2x" imagesizes="100vw">
@@ -54,6 +54,15 @@
     <img data-src="img/lazy.png" alt="Lazy loaded mountain" class="lazy">
     <div class="bg" style="background: url('img/bg.png') no-repeat"></div>
     <div class="orphan"><span>Orphan text in a span</span> and more text</div>
+    <div class="cta"><a href="/services/">Book now</a><a href="/about.html">Learn more</a></div>
+    <a class="post-card" href="/blog/post-1/"><span class="date">12 May 2026</span><h3>Card title</h3><p>Card excerpt text.</p></a>
+    <ul class="features"><li><h3>Feature one</h3><p>Feature one detail.</p></li><li>Plain feature</li></ul>
+    <h2><span aria-hidden="true">Split Title</span><span class="sr-only">Split Title</span></h2>
+    <details><summary>What is included?</summary><p>Flights, lodging and guides are included.</p></details>
+    <form action="/contact"><input type="text" placeholder="Your email"><select><option>Coast</option><option>Mountain</option></select><input type="submit" value="Send request"></form>
+    <article><header><h2>Post header inside article</h2></header><p>Article body.</p><footer>Article footer note</footer></article>
+    <shadow-widget></shadow-widget>
+    <script>customElements.define('shadow-widget', class extends HTMLElement { connectedCallback() { const r = this.attachShadow({ mode: 'open' }); r.innerHTML = '<style>p{margin:0}</style><p>Shadow widget text</p>'; } });</script>
     <ul id="dynamic-list"><li>Loading...</li></ul>
     <blockquote>"Best trip of my life" - a guest</blockquote>
     <a href="files/brochure.pdf">Download brochure (PDF)</a>
