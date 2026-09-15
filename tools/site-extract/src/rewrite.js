@@ -2,11 +2,16 @@
 // Node-side rewriting of stylesheet text and listing of URLs referenced by CSS.
 const { relativeHref } = require('./urls');
 
-const URL_RE = /url\(\s*(['"]?)([^'")]*?)\1\s*\)/gi;
-const IMPORT_RE = /@import\s+(['"])([^'"]+)\1/gi;
+const URL_RE = /url\(\s*(['"]?)((?:\\.|[^'")\\])*?)\1\s*\)/gi;
+const IMPORT_RE = /@import\s+(['"])((?:\\.|[^'"\\])+)\1/gi;
+
+/** Undo CSS escapes (\@, \2f , \"), so the token can be resolved as a URL. */
+function cssUnescape(v) {
+  return String(v).replace(/\\([0-9a-f]{1,6}\s?|[\s\S])/gi, (m, c) => (/^[0-9a-f]/i.test(c) ? String.fromCodePoint(parseInt(c, 16)) : c));
+}
 
 function resolveAgainst(u, base) {
-  try { return new URL(u, base).href; } catch { return null; }
+  try { return new URL(cssUnescape(u), base).href; } catch { return null; }
 }
 
 /** Absolute URLs referenced by a stylesheet (url() and @import). */
@@ -46,4 +51,4 @@ function rewriteCss(cssText, cssUrl, cssLocal, lookup) {
     .replace(IMPORT_RE, (m, q, u) => { const l = swap(u); return l ? `@import ${q}${l}${q}` : m; });
 }
 
-module.exports = { cssReferences, rewriteCss };
+module.exports = { cssReferences, rewriteCss, cssUnescape };

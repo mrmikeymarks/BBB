@@ -15,14 +15,19 @@ const A2X = sanitizeSegment('a@2x.png'); // '@' is not filesystem-safe, so the n
 const read = (f) => fs.readFileSync(f, 'utf8');
 const exists = (f) => fs.existsSync(f);
 
+const tmpDirs = [];
+const log = [];
+setTimeout(() => { console.error('TEST TIMEOUT after 240s'); process.exit(1); }, 240000).unref();
+
 async function main() {
   const fixture = await start();
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'site-extract-test-'));
-  const log = [];
+  tmpDirs.push(out);
   let manifest;
   try {
-    manifest = await crawl(fixture.origin + '/', { out, concurrency: 2, delay: 0, wait: 300, timeout: 15000, log: (m) => log.push(m) });
+    manifest = await crawl(fixture.origin + '/', { out, concurrency: 2, delay: 0, wait: 300, timeout: 4000, log: (m) => log.push(m) });
   } finally { fixture.server.close(); }
+  assert.ok(!log.some((l) => /^\[error\]/.test(l)), `crawler logged errors:\n${log.filter((l) => /^\[error\]/.test(l)).join('\n')}`);
 
   const site = path.join(out, 'site');
   const A = `_assets/127.0.0.1_${fixture.port}`;
@@ -33,12 +38,17 @@ async function main() {
   assert.deepStrictEqual(pageUrls, [
     `${origin}/`, `${origin}/about.html`, `${origin}/blog/post-1`, `${origin}/blog/post-2`, `${origin}/orphan-page.html`, `${origin}/services`,
     `${origin}/team/john.smith`, `${origin}/team/john.doe`, `${origin}/%E4%BC%9A%E7%A4%BE%E6%A6%82%E8%A6%81`, `${origin}/%E3%81%8A%E5%95%8F%E3%81%84%E5%90%88%E3%82%8F%E3%81%9B`,
-    `${origin}/latin.html`,
+    `${origin}/latin.html`, `${origin}/slash-only`,
   ].sort(), 'crawled page set');
   assert.strictEqual(manifest.pages.find((p) => p.url === `${origin}/fb`).kind, 'external-redirect', 'off-site redirect recorded');
   assert.strictEqual(manifest.pages.find((p) => p.url === `${origin}/download`).kind, 'file', 'attachment download captured as file');
   assert.ok(!manifest.assets[`${origin}/`] && !manifest.assets[`${origin}/about.html`] && !manifest.assets[`${origin}/services`] && !manifest.assets[`${origin}/services/`], `pages must not be captured as raw assets: ${Object.keys(manifest.assets).filter((k) => /html|\/$/.test(k))}`);
   assert.strictEqual(manifest.pages.find((p) => p.url === `${origin}/menu`).kind, 'file', 'extension-less PDF recorded as file');
+  const slashOnly = manifest.pages.find((p) => p.url === `${origin}/slash-only`);
+  assert.ok(slashOnly && slashOnly.status === 200 && slashOnly.kind === 'page', `page served only with a trailing slash is fetched as linked: ${JSON.stringify(slashOnly)}`);
+  const hang = manifest.pages.find((p) => p.url === `${origin}/hang`);
+  assert.ok(hang && /timed out/.test(hang.error || '') && !manifest.aliases[`${origin}/hang`], `never-answering page is an error, not an alias: ${JSON.stringify(hang)} ${JSON.stringify(manifest.aliases)}`);
+  assert.ok(!fs.existsSync(path.join(site, 'hang/index.html')), 'no stub for a page that never loaded');
   assert.strictEqual(manifest.pages.find((p) => p.url === `${origin}/feed`).kind, 'file', 'RSS feed recorded as file, not page');
   const p404 = manifest.pages.find((p) => p.url === `${origin}/blog/post-2`);
   assert.strictEqual(p404.status, 404, '404 page recorded with its status');
@@ -58,7 +68,7 @@ async function main() {
     const got = read(path.join(site, f));
     assert.ok(got.length > 0 && (expected === null || got === expected), `asset body captured intact: ${f} (${JSON.stringify(got.slice(0, 30))})`);
   }
-  assert.ok(fs.statSync(path.join(site, `${A}/img/real.png`)).size === fs.statSync(path.join(__dirname, 'fixture/img/real.png')).size, 'valid PNG captured byte-for-byte');
+  assert.ok(fs.readFileSync(path.join(site, `${A}/img/real.png`)).equals(fs.readFileSync(path.join(__dirname, 'fixture/img/real.png'))), 'valid PNG captured byte-for-byte');
 
   // ---- HTML rewriting ----------------------------------------------------
   const home = read(path.join(site, 'index.html'));
@@ -83,7 +93,10 @@ async function main() {
   assert.ok(new RegExp(`<style id="cssom">[^<]*url\\("?${A.replace(/[.]/g, '\\.')}/img/bg\\.png`).test(home), `CSSOM rules serialised and rewritten: ${home.match(/<style id="cssom">[^<]*<\/style>/)}`);
   assert.ok(home.includes(`imagesrcset="${A}/img/a.png 1x, ${A}/img/${A2X} 2x"`), 'imagesrcset rewritten');
   assert.ok(home.includes(`href="fb/index.html"`) && read(path.join(site, 'fb/index.html')).includes('url=https://external.example.org/fb'), 'external redirect stub');
-  assert.ok(home.includes(`href="download/index.html"`) && /url=\.\.\/_assets\/[^"]*\/download\.bin"?/.test(read(path.join(site, 'download/index.html'))) || read(path.join(site, 'download/index.html')).includes('_assets/'), `download stub: ${read(path.join(site, 'download/index.html'))}`);
+  assert.ok(home.includes(`href="download/index.html"`), 'extension-less download link goes to its stub');
+  const dl = manifest.pages.find((p) => p.url === `${origin}/download`);
+  assert.ok(dl && dl.kind === 'file' && dl.local.endsWith('/download.bin'), `attachment saved with the Content-Disposition extension: ${JSON.stringify(dl)}`);
+  assert.ok(read(path.join(site, 'download/index.html')).includes(`url=../${dl.local.replace(/^site\//, '')}`), 'download stub forwards to the captured file');
   assert.ok(home.startsWith('<!DOCTYPE html>') && /<head><meta charset="utf-8"><base href="index.html" data-mirror="base"><script data-mirror="config">/.test(home), `charset meta, frozen base, then shim: ${home.slice(0, 260)}`);
   const latin = fs.readFileSync(path.join(site, 'latin.html'));
   assert.ok(latin.toString('utf8').includes('<meta charset="utf-8">') && !latin.toString('utf8').includes('iso-8859-1') && latin.toString('utf8').includes('Café crème €'), 'latin-1 page re-declared as utf-8 with intact text');
@@ -121,6 +134,7 @@ async function main() {
   assert.ok(css.includes('url("../img/bg.png")'), 'absolute css url rewritten');
   assert.ok(css.includes('url(../img/cdn-only.png)'), 'css-only asset fetched and rewritten');
   assert.ok(css.includes("url('data:image/svg+xml"), 'data: url untouched');
+  assert.ok(css.includes(`url(../img/${A2X})`), `CSS-escaped url() resolved and rewritten: ${css.match(/\.esc[^}]*}/)}`);
 
   // ---- shim map -----------------------------------------------------------
   const map = JSON.parse(read(path.join(site, '_mirror/map.js')).replace(/^window\.__MIRROR_MAP=/, '').replace(/;\s*$/, ''));
@@ -249,7 +263,7 @@ async function main() {
     assert.ok(m3.uncrawled.length > 0, 'uncrawled URLs reported');
   } finally { fixture3.server.close(); fs.rmSync(out3, { recursive: true, force: true }); }
   const { spawnSync } = require('child_process');
-  const cli = spawnSync(process.execPath, [path.join(__dirname, '../src/crawl.js'), 'http://127.0.0.1:9/', '--out', path.join(os.tmpdir(), 'site-extract-test-unreachable'), '--timeout', '5000', '--no-sitemap', '--no-screenshots'], { encoding: 'utf8', env: { ...process.env } });
+  const cli = spawnSync(process.execPath, [path.join(__dirname, '../src/crawl.js'), 'http://127.0.0.1:9/', '--out', path.join(os.tmpdir(), 'site-extract-test-unreachable'), '--timeout', '5000', '--no-sitemap', '--no-screenshots'], { encoding: 'utf8', env: { ...process.env }, timeout: 60000 });
   assert.strictEqual(cli.status, 3, `CLI exits 3 when nothing could be crawled (got ${cli.status}): ${cli.stderr.slice(-400)}`);
   assert.ok(/No pages could be crawled/.test(cli.stderr), 'CLI explains the failure');
   fs.rmSync(path.join(os.tmpdir(), 'site-extract-test-unreachable'), { recursive: true, force: true });
@@ -257,6 +271,7 @@ async function main() {
   // ---- strip-scripts variant ----------------------------------------------
   const fixture2 = await start();
   const out2 = fs.mkdtempSync(path.join(os.tmpdir(), 'site-extract-test-static-'));
+  tmpDirs.push(out2);
   try {
     await crawl(fixture2.origin + '/', { out: out2, concurrency: 1, delay: 0, wait: 200, timeout: 15000, stripScripts: true, screenshots: false, sitemap: false, maxPages: 1, log: () => {} });
   } finally { fixture2.server.close(); }
@@ -271,4 +286,9 @@ async function main() {
   if (manifest.counts.failed) console.log('failed:', manifest.failed);
 }
 
-main().catch((e) => { console.error('TEST FAILED:', e && e.stack || e); process.exit(1); });
+main().catch((e) => {
+  console.error('TEST FAILED:', e && e.stack || e);
+  if (tmpDirs.length) console.error('Output kept for inspection:', tmpDirs.join(', '));
+  if (log.length) console.error('Last crawler log lines:\n' + log.slice(-20).join('\n'));
+  process.exit(1);
+});

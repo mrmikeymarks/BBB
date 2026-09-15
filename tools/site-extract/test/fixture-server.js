@@ -13,6 +13,9 @@ function start(port = 0) {
     const url = new URL(req.url, 'http://x');
     const host = req.headers.host;
     if (url.pathname === '/old') { res.writeHead(301, { Location: '/about.html' }); return res.end(); }
+    if (url.pathname === '/slash-only') { res.writeHead(404, { 'content-type': 'text/html' }); return res.end('<h1>Not found (no trailing slash)</h1>'); }
+    if (url.pathname === '/slash-only/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Slash only</title></head><body><main><h1>Only served with a trailing slash</h1></main></body></html>'); }
+    if (url.pathname === '/hang') { return; /* never answers */ }
     if (url.pathname === '/fb') { res.writeHead(302, { Location: 'https://external.example.org/fb' }); return res.end(); }
     if (url.pathname === '/download') { res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="price-list.bin"' }); return res.end('BINARY-DOWNLOAD'); }
     if (url.pathname === '/latin.html') { res.writeHead(200, { 'content-type': 'text/html; charset=iso-8859-1' }); return res.end(fs.readFileSync(path.join(ROOT, 'latin.html'))); }

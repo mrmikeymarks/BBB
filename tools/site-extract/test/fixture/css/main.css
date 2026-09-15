@@ -4,3 +4,4 @@ body { font-family: "Fixture", sans-serif; }
 .bg { background: url("/img/bg.png"); }
 .icon { background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg"/>'); }
 .cdn { background: url(../img/cdn-only.png); }
+.esc { background: url(../img/a\@2x.png); }

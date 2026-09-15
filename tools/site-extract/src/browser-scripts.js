@@ -35,11 +35,12 @@ function scanPage() {
     }
     return out;
   }
+  const cssUnescape = (v) => String(v).replace(/\\([0-9a-f]{1,6}\s?|[\s\S])/gi, (m, c) => (/^[0-9a-f]/i.test(c) ? String.fromCodePoint(parseInt(c, 16)) : c));
   const cssUrls = (text) => {
-    const out = []; const re = /url\(\s*(['"]?)([^'")]*?)\1\s*\)/gi; let m;
-    while ((m = re.exec(text || ''))) if (m[2] && !/^(data:|blob:|#|about:)/i.test(m[2])) out.push(m[2]);
-    const im = /@import\s+(['"])([^'"]+)\1/gi;
-    while ((m = im.exec(text || ''))) out.push(m[2]);
+    const out = []; const re = /url\(\s*(['"]?)((?:\\.|[^'")\\])*?)\1\s*\)/gi; let m;
+    while ((m = re.exec(text || ''))) if (m[2] && !/^(data:|blob:|#|about:)/i.test(m[2])) out.push(cssUnescape(m[2]));
+    const im = /@import\s+(['"])((?:\\.|[^'"\\])+)\1/gi;
+    while ((m = im.exec(text || ''))) out.push(cssUnescape(m[2]));
     return out;
   };
 
@@ -252,9 +253,10 @@ function rewriteDocument(arg) {
     return out;
   }
   const rewriteSrcset = (v) => parseSrcset(v).map((c) => (localFor(c.url) || c.url) + (c.desc ? ' ' + c.desc : '')).join(', ');
+  const cssUnescape = (v) => String(v).replace(/\\([0-9a-f]{1,6}\s?|[\s\S])/gi, (m, c) => (/^[0-9a-f]/i.test(c) ? String.fromCodePoint(parseInt(c, 16)) : c));
   const rewriteCssText = (text) => String(text || '')
-    .replace(/url\(\s*(['"]?)([^'")]*?)\1\s*\)/gi, (m, q, u) => { if (!u || /^(data:|blob:|#|about:)/i.test(u)) return m; const l = localFor(u); return l ? `url(${q}${l}${q})` : m; })
-    .replace(/@import\s+(['"])([^'"]+)\1/gi, (m, q, u) => { const l = localFor(u); return l ? `@import ${q}${l}${q}` : m; });
+    .replace(/url\(\s*(['"]?)((?:\\.|[^'")\\])*?)\1\s*\)/gi, (m, q, u) => { if (!u || /^(data:|blob:|#|about:)/i.test(u)) return m; const l = localFor(cssUnescape(u)); return l ? `url(${q}${l}${q})` : m; })
+    .replace(/@import\s+(['"])((?:\\.|[^'"\\])+)\1/gi, (m, q, u) => { const l = localFor(cssUnescape(u)); return l ? `@import ${q}${l}${q}` : m; });
 
   const root = document.documentElement.cloneNode(true);
   // Stylesheets whose rules live only in the CSSOM (insertRule, CSS-in-JS) have

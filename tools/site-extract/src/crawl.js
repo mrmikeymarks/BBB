@@ -104,11 +104,21 @@ class Crawler {
     } catch (e) { this.log(`[warn] could not fetch the start URL: ${firstLine(e)}`); }
   }
 
-  enqueue(href) {
+  /** Queue a normalised page URL; `navUrl` is the form to navigate to (keeps a trailing slash the site linked). */
+  enqueue(href, navUrl) {
     if (this.pages.has(href)) return false;
-    this.pages.set(href, { url: href, done: false });
+    this.pages.set(href, { url: href, navUrl: navUrl && navUrl !== href ? navUrl : undefined, done: false });
     this.queue.push(href);
     return true;
+  }
+
+  /** The URL to navigate to for a normalised page URL, as the site linked it. */
+  navForm(n, raw) {
+    try {
+      const r = new URL(raw);
+      if (r.pathname.length > 1 && r.pathname.endsWith('/') && !n.pathname.endsWith('/')) { const u = new URL(n.href); u.pathname += '/'; return u.href; }
+    } catch { /* ignore */ }
+    return n.href;
   }
 
   resolveLocal(key) {
@@ -148,11 +158,11 @@ class Crawler {
     return local;
   }
 
-  saveAsset(key, body, contentType, kind) {
+  saveAsset(key, body, contentType, kind, fileNameHint) {
     const existing = this.assets.get(key);
     if (existing && existing.local) return existing;
     if (this.assets.size >= this.opts.maxAssets) { this.failed.set(key, 'max-assets reached'); return null; }
-    const local = this.claimLocalPath(U.assetLocalPath(new URL(key), contentType), key);
+    const local = this.claimLocalPath(U.assetLocalPath(new URL(key), contentType, fileNameHint), key);
     const rec = { local, contentType, size: body.length, kind };
     this.assets.set(key, rec);
     if (/^text\/css/.test(contentType)) {
@@ -222,7 +232,8 @@ class Crawler {
         const body = await r.body();
         if (body.length > this.opts.maxAssetBytes) { this.failed.set(key, 'too large'); return null; }
         const ct = (r.headers()['content-type'] || '').split(';')[0].trim().toLowerCase();
-        const rec = this.saveAsset(finalKey, body, ct, kind);
+        const cd = (r.headers()['content-disposition'] || '').match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+        const rec = this.saveAsset(finalKey, body, ct, kind, cd ? decodeURIComponent(cd[1].trim()) : undefined);
         return rec ? rec.local : null;
       } catch (e) {
         this.failed.set(key, firstLine(e));
@@ -259,7 +270,7 @@ class Crawler {
           const loc = m[1].replace(/&amp;/g, '&');
           if (isIndex) { sitemaps.push(loc); continue; }
           const n = U.normalizePageUrl(loc);
-          if (n && this.isSameSite(n) && !U.looksLikeFile(n) && this.enqueue(this.canonPage(n).href)) added++;
+          if (n && this.isSameSite(n) && !U.looksLikeFile(n) && this.enqueue(this.canonPage(n).href, this.navForm(n, loc))) added++;
         }
         if (!found) this.log(`[sitemap] ${sm}: no <loc> entries`);
       } catch (e) { this.log(`[sitemap] ${sm}: ${firstLine(e)}`); }
@@ -271,8 +282,10 @@ class Crawler {
     const rec = this.pages.get(pageUrl);
     rec.startedAt = new Date().toISOString();
     let resp = null;
+    const before = page.url();
+    const navUrl = rec.navUrl || pageUrl;
     try {
-      resp = await page.goto(pageUrl, { waitUntil: 'load', timeout: this.opts.timeout });
+      resp = await page.goto(navUrl, { waitUntil: 'load', timeout: this.opts.timeout });
     } catch (e) {
       if (!/Timeout/i.test(e.message)) {
         // A redirect chain that leaves the site (vanity /facebook links) can fail
@@ -287,6 +300,14 @@ class Crawler {
         const asset = local && [...this.assets.values()].find((a) => a.local === local);
         if (asset && !/html/.test(asset.contentType || '')) { rec.kind = 'file'; rec.local = local; rec.done = true; return rec; }
         rec.error = firstLine(e); rec.done = true; return rec;
+      }
+      if (page.url() === before || page.url() === 'about:blank') {
+        // Nothing committed: the tab still shows the previous document.
+        let hop = pageUrl; let end = null;
+        for (let i = 0; i < 10 && this.redirects.has(hop); i++) { hop = this.redirects.get(hop); end = hop; }
+        const endU = end && U.normalizePageUrl(end);
+        if (endU && !this.isSameSite(endU)) { rec.finalUrl = endU.href; rec.kind = 'external-redirect'; rec.done = true; return rec; }
+        rec.error = 'navigation timed out before commit'; rec.done = true; return rec;
       }
       this.log(`[warn] load timeout, continuing with partial page: ${pageUrl}`);
     }
@@ -348,7 +369,7 @@ class Crawler {
         continue;
       }
       pagePathFor[rawKey] = this.pageLocal(n);
-      if (this.enqueue(n.href)) newLinks++;
+      if (this.enqueue(n.href, this.navForm(n, raw))) newLinks++;
     }
     // Fetch referenced assets the browser did not load (other srcset candidates, lazy images, file links).
     const isKnownPage = (k) => { const n = U.normalizePageUrl(k); if (!n) return false; const r = this.pages.get(n.href); return n.href === canonicalHref || n.href === pageUrl || !!(r && r.kind !== 'file'); };

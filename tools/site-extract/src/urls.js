@@ -133,8 +133,12 @@ function extFromContentType(ct) {
   return '';
 }
 
-/** Local path (posix, relative to site root) for an asset URL. */
-function assetLocalPath(u, contentType) {
+/**
+ * Local path (posix, relative to site root) for an asset URL. `fileNameHint`
+ * (Content-Disposition filename) supplies an extension when neither the URL
+ * nor the content type has a useful one.
+ */
+function assetLocalPath(u, contentType, fileNameHint) {
   const host = sanitizeSegment(u.hostname + (u.port ? '_' + u.port : ''));
   const decoded = safeDecode(u.pathname);
   const endsWithSlash = decoded.endsWith('/') || decoded === '';
@@ -144,7 +148,8 @@ function assetLocalPath(u, contentType) {
   let base = m[1] || file;
   let ext = (m[2] || '').toLowerCase();
   if (!base) { base = ext; ext = ''; } // dotfiles like ".well-known"
-  const wantExt = extFromContentType(contentType);
+  let wantExt = extFromContentType(contentType);
+  if (!wantExt && !ext && fileNameHint) { const hm = String(fileNameHint).match(/(\.[A-Za-z0-9]{1,8})$/); if (hm) wantExt = hm[1].toLowerCase(); }
   if (wantExt) {
     const okFamily = (ext === wantExt)
       || (wantExt === '.js' && (ext === '.mjs' || ext === '.cjs'))
